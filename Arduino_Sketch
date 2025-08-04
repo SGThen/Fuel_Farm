@@ -23,18 +23,18 @@ const int outputSlotGreenLights = 7;  // Slot 7: Green Lights
 // REGISTER MAP
 const int REG_LEVEL_START = 0;
 const int REG_FLOW_START = 10;
-const int REG_MODE_STATUS = 20; // Input register for mode
+const int REG_MODE_STATUS = 20; // Input register for mode on off auto
 const int COIL_FILL_START = 0;
 const int COIL_PUMP_LEAD = 10;
 const int COIL_PUMP_LAG = 11;
 
 // Automatic fill threshold (percent)
-const float FILL_START_THRESHOLD = 30.0;
-const float FILL_STOP_THRESHOLD = 90.0;
+const float FILL_START_THRESHOLD = 40.0;
+const float FILL_STOP_THRESHOLD = 80.0;
 
 // Pump alternation
 unsigned long lastPumpSwitchTime = 0;
-const unsigned long pumpSwitchInterval = 60000UL; // switch every 60 seconds
+const unsigned long pumpSwitchInterval = 60000UL; // switch every 60 seconds this is for testing need to change to 60 min when done testing
 bool leadPumpIsPump1 = true;
 unsigned long pump1Runtime = 0;
 unsigned long pump2Runtime = 0;
