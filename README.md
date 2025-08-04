@@ -9,3 +9,7 @@ There are:
   1 EPO each
   1 4-20mA level sensor each
   1 red light each
+
+
+First step is to get the pumps to run in a lead lag not based on time but running instanses. 
+then it is on to running a fail safe for if a pump does not start. 
