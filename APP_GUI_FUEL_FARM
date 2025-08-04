@@ -1,0 +1,176 @@
+import tkinter as tk
+from tkinter import ttk
+from pymodbus.client import ModbusTcpClient
+from pymodbus.exceptions import ModbusIOException
+import threading
+import time
+import queue
+import logging
+import pkg_resources
+
+# Enable pymodbus debugging
+logging.basicConfig()
+logging.getLogger('pymodbus').setLevel(logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# Configuration
+PLC_IP = "192.168.1.100"
+PLC_PORT = 502
+MODBUS_UNIT_ID = 1
+POLLING_INTERVAL = 0.5
+MODBUS_TIMEOUT = 3
+NUM_TANKS = 9
+NUM_FLOWS = 2
+
+# Modbus register and coil addresses
+REG_TANK_LEVELS = 0
+REG_FLOW_LEVELS = 10
+REG_MODE_STATUS = 20
+COIL_FILL_START = 0
+COIL_PUMP_LEAD = 10
+COIL_PUMP_LAG = 11
+DISCRETE_HH_BASE = 0
+DISCRETE_EPO_BASE = 10
+DISCRETE_MAIN_EPO = 20
+
+class HMIApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("P1AM-200 HMI")
+        self.geometry("1000x750")
+        self.configure(bg="#f0f0f0")
+
+        self.client = None
+        self.connected = False
+        self.mode = 0
+        self.queue = queue.Queue()
+        self.pump_states = {COIL_PUMP_LEAD: False, COIL_PUMP_LAG: False}
+        self.valve_states = [False] * NUM_TANKS
+
+        self.create_widgets()
+        self.polling = True
+        self.initialize_client()
+        self.after(100, self.poll_data_thread)
+
+    def initialize_client(self):
+        if self.client:
+            self.client.close()
+        self.client = ModbusTcpClient(PLC_IP, port=PLC_PORT, timeout=MODBUS_TIMEOUT)
+        self.connected = False
+        logger.debug(f"Initialized Modbus client for {PLC_IP}:{PLC_PORT}")
+
+    def create_widgets(self):
+        self.conn_label = tk.Label(self, text="Connecting...", fg="red", font=("Arial", 14, "bold"))
+        self.conn_label.pack(pady=10)
+        self.mode_label = tk.Label(self, text="Mode: Unknown", font=("Arial", 16))
+        self.mode_label.pack(pady=5)
+
+        tank_frame = tk.LabelFrame(self, text="Tank Levels (%)", font=("Arial", 12))
+        tank_frame.pack(padx=10, pady=5, fill='x')
+        self.tank_level_vars = []
+        for i in range(NUM_TANKS):
+            var = tk.StringVar(value="---")
+            lbl = tk.Label(tank_frame, text=f"Tank {i+1}: ")
+            val_lbl = tk.Label(tank_frame, textvariable=var)
+            lbl.grid(row=i, column=0, sticky="w", padx=5, pady=2)
+            val_lbl.grid(row=i, column=1, sticky="w", padx=5)
+            self.tank_level_vars.append(var)
+
+        flow_frame = tk.LabelFrame(self, text="Flow Readings (GPM)", font=("Arial", 12))
+        flow_frame.pack(padx=10, pady=5, fill='x')
+        self.flow_vars = []
+        for i in range(NUM_FLOWS):
+            var = tk.StringVar(value="---")
+            lbl = tk.Label(flow_frame, text=f"Flow {i+1}: ")
+            val_lbl = tk.Label(flow_frame, textvariable=var)
+            lbl.grid(row=i, column=0, sticky="w", padx=5, pady=2)
+            val_lbl.grid(row=i, column=1, sticky="w", padx=5)
+            self.flow_vars.append(var)
+
+        pump_frame = tk.LabelFrame(self, text="Pumps Control", font=("Arial", 12))
+        pump_frame.pack(padx=10, pady=10)
+        self.pump1_btn = tk.Button(pump_frame, text="Pump 1 OFF", width=15, command=lambda: self.toggle_pump(COIL_PUMP_LEAD))
+        self.pump1_btn.grid(row=0, column=0, padx=10, pady=5)
+        self.pump2_btn = tk.Button(pump_frame, text="Pump 2 OFF", width=15, command=lambda: self.toggle_pump(COIL_PUMP_LAG))
+        self.pump2_btn.grid(row=0, column=1, padx=10, pady=5)
+
+        valve_frame = tk.LabelFrame(self, text="Valve Control", font=("Arial", 12))
+        valve_frame.pack(padx=10, pady=10, fill='x')
+        self.valve_btns = []
+        for i in range(NUM_TANKS):
+            btn = tk.Button(valve_frame, text=f"Valve {i+1} CLOSED", width=12, command=lambda idx=i: self.toggle_valve(idx))
+            btn.grid(row=i//5, column=i%5, padx=5, pady=5)
+            self.valve_btns.append(btn)
+
+        status_frame = tk.LabelFrame(self, text="Alarms and HH Switches", font=("Arial", 12))
+        status_frame.pack(padx=10, pady=10, fill='both', expand=True)
+        self.status_text = tk.Text(status_frame, height=8, font=("Courier", 10))
+        self.status_text.pack(fill='both', expand=True)
+        self.status_text.tag_configure("alarm", foreground="red", font=("Courier", 10, "bold"))
+        self.status_text.tag_configure("normal", foreground="black", font=("Courier", 10))
+
+    def log(self, msg, alarm=False):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        tag = "alarm" if alarm else "normal"
+        self.status_text.insert(tk.END, f"[{timestamp}] {msg}\n", tag)
+        self.status_text.see(tk.END)
+        logger.debug(f"Log: {msg} {'[ALARM]' if alarm else ''}")
+
+    def read_input_registers(self, address, count):
+        return self.client.read_input_registers(address=address, count=count, slave=MODBUS_UNIT_ID)
+
+    def read_holding_registers(self, address, count):
+        return self.client.read_holding_registers(address=address, count=count, slave=MODBUS_UNIT_ID)
+
+    def read_coils(self, address, count):
+        return self.client.read_coils(address=address, count=count, slave=MODBUS_UNIT_ID)
+
+    def read_discrete_inputs(self, address, count):
+        return self.client.read_discrete_inputs(address=address, count=count, slave=MODBUS_UNIT_ID)
+
+    def write_coil(self, address, value):
+        return self.client.write_coil(address=address, value=value, slave=MODBUS_UNIT_ID)
+
+    def toggle_pump(self, coil_addr):
+        rr = self.read_coils(coil_addr, 1)
+        if rr and not rr.isError():
+            current = rr.bits[0]
+            self.write_coil(coil_addr, not current)
+
+    def toggle_valve(self, index):
+        coil_addr = COIL_FILL_START + index
+        rr = self.read_coils(coil_addr, 1)
+        if rr and not rr.isError():
+            current = rr.bits[0]
+            self.write_coil(coil_addr, not current)
+
+    def poll_data_thread(self):
+        threading.Thread(target=self.poll_data, daemon=True).start()
+
+    def poll_data(self):
+        while self.polling:
+            try:
+                if not self.client.connect():
+                    raise ConnectionError("Unable to connect to PLC")
+                self.connected = True
+                self.conn_label.config(text="Connected", fg="green")
+                rr_mode = self.read_input_registers(REG_MODE_STATUS, 1)
+                if rr_mode and not rr_mode.isError():
+                    self.mode = rr_mode.registers[0]
+                    self.mode_label.config(text=f"Mode: {['OFF','HAND','AUTO'][self.mode]}")
+            except Exception as e:
+                self.connected = False
+                self.conn_label.config(text="Disconnected", fg="red")
+                self.log(f"Connection error: {e}", alarm=True)
+            time.sleep(POLLING_INTERVAL)
+
+    def destroy(self):
+        self.polling = False
+        if self.client:
+            self.client.close()
+        super().destroy()
+
+if __name__ == "__main__":
+    app = HMIApp()
+    app.after(100, app.update)  # This line replaces the missing update_gui reference
+    app.mainloop()
