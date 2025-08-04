@@ -1,0 +1,222 @@
+#include <P1AM.h>
+#include <Ethernet.h>
+#include <ArduinoModbus.h>
+
+// NETWORK SETTINGS
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+IPAddress ip(192, 168, 1, 100);
+EthernetServer ethServer(502);
+
+// MODBUS SERVER
+ModbusTCPServer modbus;
+
+// CONSTANTS
+const int numTanks = 9;
+const int numFlows = 2;
+
+// SLOT ASSIGNMENTS
+const int analogSlots[] = {1, 2};     // Slot 1 & 2: 4-20mA Analog Inputs
+const int digitalInputSlots[] = {3, 4, 5}; // Slots 3,4,5: Digital Inputs
+const int outputSlotValves = 6;       // Slot 6: Pumps + Valves
+const int outputSlotGreenLights = 7;  // Slot 7: Green Lights
+
+// REGISTER MAP
+const int REG_LEVEL_START = 0;
+const int REG_FLOW_START = 10;
+const int REG_MODE_STATUS = 20; // Input register for mode
+const int COIL_FILL_START = 0;
+const int COIL_PUMP_LEAD = 10;
+const int COIL_PUMP_LAG = 11;
+
+// Automatic fill threshold (percent)
+const float FILL_START_THRESHOLD = 30.0;
+const float FILL_STOP_THRESHOLD = 90.0;
+
+// Pump alternation
+unsigned long lastPumpSwitchTime = 0;
+const unsigned long pumpSwitchInterval = 60000UL; // switch every 60 seconds
+bool leadPumpIsPump1 = true;
+unsigned long pump1Runtime = 0;
+unsigned long pump2Runtime = 0;
+unsigned long pump1StartTime = 0;
+unsigned long pump2StartTime = 0;
+
+// Helper to read digital input
+bool readDigitalInput(int slot, int channel) {
+  return P1.readDiscrete(slot, channel);
+}
+
+// Helper to write digital output
+void writeDigitalOutput(int slot, int channel, bool state) {
+  P1.writeDiscrete(slot, channel, state);
+}
+
+// Analog scaling helpers
+const int analogMax = 65535;
+const float mA_min = 4.0;
+const float mA_max = 20.0;
+const float levelMax = 100.0;
+const float flowMax = 50.0;
+
+float scaleAnalogToPercent(uint16_t raw) {
+  float voltage = (raw / (float)analogMax) * 20.0;
+  float mA = constrain(voltage, mA_min, mA_max);
+  return ((mA - mA_min) / (mA_max - mA_min)) * levelMax;
+}
+
+float scaleAnalogToFlow(uint16_t raw) {
+  float voltage = (raw / (float)analogMax) * 20.0;
+  float mA = constrain(voltage, mA_min, mA_max);
+  return ((mA - mA_min) / (mA_max - mA_min)) * flowMax;
+}
+
+void updatePumpRuntime(bool pump1On, bool pump2On) {
+  unsigned long now = millis();
+  if (pump1On) {
+    if (pump1StartTime == 0) pump1StartTime = now;
+    pump1Runtime += now - pump1StartTime;
+    pump1StartTime = now;
+  } else {
+    pump1StartTime = 0;
+  }
+
+  if (pump2On) {
+    if (pump2StartTime == 0) pump2StartTime = now;
+    pump2Runtime += now - pump2StartTime;
+    pump2StartTime = now;
+  } else {
+    pump2StartTime = 0;
+  }
+
+  modbus.holdingRegisterWrite(22, pump1Runtime / 1000); // seconds
+  modbus.holdingRegisterWrite(23, pump2Runtime / 1000);
+}
+
+void setup() {
+  Serial.begin(115200);
+  P1.init();
+  Ethernet.begin(mac, ip);
+  ethServer.begin();
+
+  if (!modbus.begin()) {
+    Serial.println("Failed to start Modbus TCP Server!");
+    while (1);
+  }
+
+  modbus.configureHoldingRegisters(REG_LEVEL_START, 30);
+  modbus.configureInputRegisters(REG_MODE_STATUS, 1);
+  modbus.configureCoils(COIL_FILL_START, 20);
+  modbus.configureDiscreteInputs(0, 30);
+  modbus.configureHoldingRegisters(22, 2); // runtime registers
+
+  Serial.println("Modbus TCP Server started.");
+}
+
+void loop() {
+  EthernetClient client = ethServer.available();
+  if (client) {
+    modbus.accept(client);
+  }
+
+  float tankLevels[numTanks];
+
+  // Read tank levels
+  for (int i = 0; i < numTanks; i++) {
+    int slot = analogSlots[i / 8];
+    int channel = i % 8;
+    uint16_t raw = P1.readAnalog(slot, channel);
+    float levelPercent = scaleAnalogToPercent(raw);
+    tankLevels[i] = levelPercent;
+    modbus.holdingRegisterWrite(REG_LEVEL_START + i, (uint16_t)(levelPercent * 100));
+  }
+
+  // Read flows
+  for (int i = 0; i < numFlows; i++) {
+    int slot = analogSlots[1];
+    int channel = i + 1;
+    uint16_t raw = P1.readAnalog(slot, channel);
+    float flowGPM = scaleAnalogToFlow(raw);
+    modbus.holdingRegisterWrite(REG_FLOW_START + i, (uint16_t)(flowGPM * 100));
+  }
+
+  // HH switches
+  for (int i = 0; i < numTanks; i++) {
+    bool hh = readDigitalInput(digitalInputSlots[0], i);
+    modbus.discreteInputWrite(i, hh);
+  }
+
+  // EPO switches
+  for (int i = 0; i < numTanks; i++) {
+    bool epotank = readDigitalInput(digitalInputSlots[1], i);
+    modbus.discreteInputWrite(10 + i, epotank);
+  }
+  bool mainEPO = readDigitalInput(digitalInputSlots[2], 0);
+  modbus.discreteInputWrite(20, mainEPO);
+
+  // Mode selector
+  bool modeOFF = readDigitalInput(digitalInputSlots[2], 1);
+  bool modeHAND = readDigitalInput(digitalInputSlots[2], 2);
+  bool modeAUTO = readDigitalInput(digitalInputSlots[2], 3);
+
+  uint16_t modeValue = 0;
+  if (modeHAND) modeValue = 1;
+  else if (modeAUTO) modeValue = 2;
+  modbus.inputRegisterWrite(REG_MODE_STATUS, modeValue);
+
+  // Pump ON switches
+  bool pump1Switch = readDigitalInput(digitalInputSlots[2], 4);
+  bool pump2Switch = readDigitalInput(digitalInputSlots[2], 5);
+
+  // Control logic
+  bool anyFilling = false;
+
+  if (mainEPO) {
+    for (int i = 0; i < numTanks; i++) {
+      writeDigitalOutput(outputSlotValves, i + 2, false);
+      writeDigitalOutput(outputSlotGreenLights, i, false);
+    }
+    writeDigitalOutput(outputSlotValves, 0, false);
+    writeDigitalOutput(outputSlotValves, 1, false);
+  } else {
+    if (modeValue == 2) {
+      for (int i = 0; i < numTanks; i++) {
+        float level = tankLevels[i];
+        if (level < FILL_START_THRESHOLD) {
+          modbus.coilWrite(COIL_FILL_START + i, true);
+        } else if (level > FILL_STOP_THRESHOLD) {
+          modbus.coilWrite(COIL_FILL_START + i, false);
+        }
+      }
+    }
+
+    for (int i = 0; i < numTanks; i++) {
+      bool valveCoil = modbus.coilRead(COIL_FILL_START + i);
+      writeDigitalOutput(outputSlotValves, i + 2, valveCoil);
+      writeDigitalOutput(outputSlotGreenLights, i, valveCoil);
+      if (valveCoil) anyFilling = true;
+    }
+
+    bool pump1On = false;
+    bool pump2On = false;
+
+    if (modeValue == 1) {
+      pump1On = pump1Switch;
+      pump2On = pump2Switch;
+    } else if (modeValue == 2) {
+      if (millis() - lastPumpSwitchTime > pumpSwitchInterval) {
+        leadPumpIsPump1 = !leadPumpIsPump1;
+        lastPumpSwitchTime = millis();
+      }
+      if (anyFilling) {
+        pump1On = leadPumpIsPump1;
+        pump2On = !leadPumpIsPump1;
+      }
+    }
+
+    writeDigitalOutput(outputSlotValves, 0, pump1On);
+    writeDigitalOutput(outputSlotValves, 1, pump2On);
+    updatePumpRuntime(pump1On, pump2On);
+  }
+
+  delay(50);
+}
