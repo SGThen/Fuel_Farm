@@ -23,18 +23,18 @@ const int outputSlotGreenLights = 7;  // Slot 7: Green Lights
 // REGISTER MAP
 const int REG_LEVEL_START = 0;
 const int REG_FLOW_START = 10;
-const int REG_MODE_STATUS = 20; // Input register for mode on off auto
+const int REG_MODE_STATUS = 20; // Input register for mode
 const int COIL_FILL_START = 0;
 const int COIL_PUMP_LEAD = 10;
 const int COIL_PUMP_LAG = 11;
 
 // Automatic fill threshold (percent)
-const float FILL_START_THRESHOLD = 40.0;
-const float FILL_STOP_THRESHOLD = 80.0;
+const float FILL_START_THRESHOLD = 30.0;
+const float FILL_STOP_THRESHOLD = 90.0;
 
 // Pump alternation
 unsigned long lastPumpSwitchTime = 0;
-const unsigned long pumpSwitchInterval = 60000UL; // switch every 60 seconds this is for testing need to change to 60 min when done testing
+const unsigned long pumpSwitchInterval = 60000UL; // switch every 60 seconds
 bool leadPumpIsPump1 = true;
 unsigned long pump1Runtime = 0;
 unsigned long pump2Runtime = 0;
@@ -163,9 +163,11 @@ void loop() {
   else if (modeAUTO) modeValue = 2;
   modbus.inputRegisterWrite(REG_MODE_STATUS, modeValue);
 
-  // Pump ON switches
-  bool pump1Switch = readDigitalInput(digitalInputSlots[2], 4);
-  bool pump2Switch = readDigitalInput(digitalInputSlots[2], 5);
+  // Pump ON/OFF switches
+  bool pump1OnSwitch = readDigitalInput(digitalInputSlots[2], 4);
+  bool pump2OnSwitch = readDigitalInput(digitalInputSlots[2], 5);
+  bool pump1OffSwitch = readDigitalInput(digitalInputSlots[2], 6);
+  bool pump2OffSwitch = readDigitalInput(digitalInputSlots[2], 7);
 
   // Control logic
   bool anyFilling = false;
@@ -200,16 +202,16 @@ void loop() {
     bool pump2On = false;
 
     if (modeValue == 1) {
-      pump1On = pump1Switch;
-      pump2On = pump2Switch;
+      pump1On = pump1OnSwitch && !pump1OffSwitch;
+      pump2On = pump2OnSwitch && !pump2OffSwitch;
     } else if (modeValue == 2) {
       if (millis() - lastPumpSwitchTime > pumpSwitchInterval) {
         leadPumpIsPump1 = !leadPumpIsPump1;
         lastPumpSwitchTime = millis();
       }
       if (anyFilling) {
-        pump1On = leadPumpIsPump1;
-        pump2On = !leadPumpIsPump1;
+        pump1On = leadPumpIsPump1 && !pump1OffSwitch;
+        pump2On = !leadPumpIsPump1 && !pump2OffSwitch;
       }
     }
 
