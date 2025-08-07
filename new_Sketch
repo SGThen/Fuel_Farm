@@ -1,0 +1,605 @@
+/*
+ * =====================================================
+ * TANK LEVEL CONTROL SYSTEM - PLC CONTROLLER v2.0
+ * =====================================================
+ * 
+ * SYSTEM OVERVIEW:
+ * - Controls 9 tank filling stations with 2 pumps
+ * - Implements pump alternation and runtime tracking
+ * - Safety interlocks: EPO, high-high level switches
+ * - Three modes: OFF, HAND (manual), AUTO (automatic)
+ * 
+ * HARDWARE CONFIGURATION:
+ * - P1AM-200 CPU with P1AM-ETH Ethernet shield
+ * - Slot 1: P1-04AD (4-20mA inputs) - Tank 1-4 levels
+ * - Slot 2: P1-04AD (4-20mA inputs) - Tank 5-9 + flows
+ * - Slot 3: P1-08SIM (Digital inputs) - HH switches 1-8
+ * - Slot 4: P1-08SIM (Digital inputs) - HH switch 9, EPO tanks 1-7
+ * - Slot 5: P1-08SIM (Digital inputs) - EPO 8-9, main EPO, mode selector
+ * - Slot 6: P1-16CDR (Relay outputs) - Pumps, fill valves
+ * - Slot 7: P1-16CDR (Relay outputs) - Status indicator lights
+ * 
+ * NETWORK CONFIGURATION:
+ * - IP Address: 192.168.1.100
+ * - Port: 502 (Modbus TCP standard)
+ * - Protocol: Modbus TCP Server
+ * 
+ * SAFETY FEATURES:
+ * - Emergency Power Off (EPO) overrides all operations
+ * - High-High level switches prevent overflow
+ * - Pump alternation prevents uneven wear
+ * - Communication watchdog monitoring
+ * 
+ * Author: Enhanced by Claude AI
+ * Version: 2.0
+ * Last Modified: August 2025
+ */
+
+#include <P1AM.h>
+#include <Ethernet.h>
+#include <ArduinoModbus.h>
+
+// =====================================================
+// NETWORK SETTINGS
+// =====================================================
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+IPAddress ip(192, 168, 1, 100);
+EthernetServer ethServer(502);
+
+// =====================================================
+// MODBUS SERVER
+// =====================================================
+ModbusTCPServer modbus;
+
+// =====================================================
+// SYSTEM CONSTANTS
+// =====================================================
+const int numTanks = 9;
+const int numFlows = 2;
+
+// SLOT ASSIGNMENTS
+const int analogSlots[] = {1, 2};           // Slot 1 & 2: 4-20mA Analog Inputs
+const int digitalInputSlots[] = {3, 4, 5};  // Slots 3,4,5: Digital Inputs
+const int outputSlotValves = 6;             // Slot 6: Pumps + Valves
+const int outputSlotGreenLights = 7;        // Slot 7: Green Lights
+
+// MODBUS REGISTER MAP
+const int REG_LEVEL_START = 0;      // Tank levels (0-8)
+const int REG_FLOW_START = 10;      // Flow readings (10-11)
+const int REG_MODE_STATUS = 20;     // Input register for mode
+const int REG_PUMP_RUNTIME1 = 22;   // Pump 1 runtime (seconds)
+const int REG_PUMP_RUNTIME2 = 23;   // Pump 2 runtime (seconds)
+const int REG_WATCHDOG = 24;        // System watchdog counter
+const int REG_SYSTEM_STATUS = 25;   // System status flags
+
+const int COIL_FILL_START = 0;      // Fill valve coils (0-8)
+const int COIL_PUMP_LEAD = 10;      // Lead pump coil
+const int COIL_PUMP_LAG = 11;       // Lag pump coil
+
+const int DISCRETE_HH_BASE = 0;     // High-high switches (0-8)
+const int DISCRETE_EPO_BASE = 10;   // Tank EPO switches (10-18)
+const int DISCRETE_MAIN_EPO = 20;   // Main EPO switch
+
+// =====================================================
+// CONTROL PARAMETERS
+// =====================================================
+const float FILL_START_THRESHOLD = 30.0;  // Start filling at 30%
+const float FILL_STOP_THRESHOLD = 90.0;   // Stop filling at 90%
+
+// PUMP MANAGEMENT
+unsigned long lastPumpSwitchTime = 0;
+const unsigned long pumpSwitchInterval = 60000UL; // Switch every 60 seconds
+bool leadPumpIsPump1 = true;
+unsigned long pump1Runtime = 0;
+unsigned long pump2Runtime = 0;
+unsigned long pump1StartTime = 0;
+unsigned long pump2StartTime = 0;
+
+// SYSTEM MONITORING
+unsigned long lastHMIContact = 0;
+const unsigned long HMI_TIMEOUT = 10000;  // 10 second timeout
+bool systemFault = false;
+unsigned long watchdogCounter = 0;
+unsigned long lastHeartbeat = 0;
+
+// ANALOG SCALING CONSTANTS
+const int analogMax = 65535;
+const float mA_min = 4.0;
+const float mA_max = 20.0;
+const float levelMax = 100.0;
+const float flowMax = 50.0;
+
+// =====================================================
+// UTILITY FUNCTIONS
+// =====================================================
+
+/**
+ * Read digital input with error checking
+ * @param slot Hardware slot number
+ * @param channel Channel within slot
+ * @return Digital input state (true/false)
+ */
+bool readDigitalInput(int slot, int channel) {
+  if (!P1.checkConnection()) {
+    Serial.println("WARNING: P1AM connection lost!");
+    systemFault = true;
+    return false;
+  }
+  return P1.readDiscrete(slot, channel);
+}
+
+/**
+ * Write digital output with error checking
+ * @param slot Hardware slot number
+ * @param channel Channel within slot
+ * @param state Output state to write
+ */
+void writeDigitalOutput(int slot, int channel, bool state) {
+  if (!P1.checkConnection()) {
+    Serial.println("ERROR: Cannot write output - P1AM connection lost!");
+    return;
+  }
+  P1.writeDiscrete(slot, channel, state);
+}
+
+/**
+ * Scale raw analog input to percentage (tank levels)
+ * @param raw Raw ADC value (0-65535)
+ * @return Scaled percentage (0-100%)
+ */
+float scaleAnalogToPercent(uint16_t raw) {
+  if (raw == 0xFFFF) {
+    Serial.println("WARNING: Invalid analog reading");
+    return -1.0; // Error indicator
+  }
+  
+  float voltage = (raw / (float)analogMax) * 20.0;
+  float mA = constrain(voltage, mA_min, mA_max);
+  return ((mA - mA_min) / (mA_max - mA_min)) * levelMax;
+}
+
+/**
+ * Scale raw analog input to flow rate (GPM)
+ * @param raw Raw ADC value (0-65535)
+ * @return Scaled flow rate (0-50 GPM)
+ */
+float scaleAnalogToFlow(uint16_t raw) {
+  if (raw == 0xFFFF) {
+    Serial.println("WARNING: Invalid flow reading");
+    return -1.0; // Error indicator
+  }
+  
+  float voltage = (raw / (float)analogMax) * 20.0;
+  float mA = constrain(voltage, mA_min, mA_max);
+  return ((mA - mA_min) / (mA_max - mA_min)) * flowMax;
+}
+
+/**
+ * Update pump runtime tracking
+ * @param pump1On Current pump 1 state
+ * @param pump2On Current pump 2 state
+ */
+void updatePumpRuntime(bool pump1On, bool pump2On) {
+  unsigned long now = millis();
+  
+  // Track pump 1 runtime
+  if (pump1On) {
+    if (pump1StartTime == 0) pump1StartTime = now;
+  } else {
+    if (pump1StartTime > 0) {
+      pump1Runtime += (now - pump1StartTime);
+      pump1StartTime = 0;
+    }
+  }
+
+  // Track pump 2 runtime
+  if (pump2On) {
+    if (pump2StartTime == 0) pump2StartTime = now;
+  } else {
+    if (pump2StartTime > 0) {
+      pump2Runtime += (now - pump2StartTime);
+      pump2StartTime = 0;
+    }
+  }
+
+  // Update Modbus registers (convert to seconds)
+  modbus.holdingRegisterWrite(REG_PUMP_RUNTIME1, pump1Runtime / 1000);
+  modbus.holdingRegisterWrite(REG_PUMP_RUNTIME2, pump2Runtime / 1000);
+}
+
+/**
+ * Perform comprehensive safety checks
+ * @return true if system is safe to operate
+ */
+bool performSafetyChecks() {
+  bool safe = true;
+  uint16_t statusFlags = 0;
+  
+  // Check P1AM module communication
+  if (!P1.checkConnection()) {
+    Serial.println("FAULT: P1AM module communication error!");
+    systemFault = true;
+    safe = false;
+    statusFlags |= 0x0001; // Bit 0: Hardware fault
+  }
+  
+  // Check for HMI communication (optional - system can run standalone)
+  if (millis() - lastHMIContact > HMI_TIMEOUT) {
+    statusFlags |= 0x0002; // Bit 1: HMI timeout (warning only)
+  }
+  
+  // Update system status register
+  modbus.holdingRegisterWrite(REG_SYSTEM_STATUS, statusFlags);
+  
+  return safe;
+}
+
+/**
+ * Handle emergency stop condition
+ * Immediately shuts down all dangerous equipment
+ */
+void handleEmergencyStop() {
+  Serial.println("EMERGENCY STOP ACTIVATED - All equipment shut down");
+  
+  // Immediate shutdown of all pumps and valves
+  for (int i = 0; i < numTanks; i++) {
+    writeDigitalOutput(outputSlotValves, i + 2, false); // Close all valves
+    writeDigitalOutput(outputSlotGreenLights, i, false); // Turn off lights
+    modbus.coilWrite(COIL_FILL_START + i, false); // Clear fill commands
+  }
+  
+  // Stop all pumps
+  writeDigitalOutput(outputSlotValves, 0, false);
+  writeDigitalOutput(outputSlotValves, 1, false);
+  modbus.coilWrite(COIL_PUMP_LEAD, false);
+  modbus.coilWrite(COIL_PUMP_LAG, false);
+}
+
+/**
+ * Print network configuration for diagnostics
+ */
+void printNetworkInfo() {
+  Serial.println("=== Network Configuration ===");
+  Serial.print("IP Address: ");
+  Serial.println(Ethernet.localIP());
+  Serial.print("Gateway: ");
+  Serial.println(Ethernet.gatewayIP());
+  Serial.print("Subnet Mask: ");
+  Serial.println(Ethernet.subnetMask());
+  Serial.print("MAC Address: ");
+  for (int i = 0; i < 6; i++) {
+    if (i > 0) Serial.print(":");
+    if (mac[i] < 0x10) Serial.print("0");
+    Serial.print(mac[i], HEX);
+  }
+  Serial.println();
+}
+
+/**
+ * Run comprehensive system diagnostics
+ */
+void runDiagnostics() {
+  Serial.println("\n=== SYSTEM DIAGNOSTICS ===");
+  
+  // Test all digital inputs
+  Serial.println("Digital Input Status:");
+  for (int slot : digitalInputSlots) {
+    Serial.print("Slot ");
+    Serial.print(slot);
+    Serial.print(": ");
+    for (int ch = 0; ch < 8; ch++) {
+      bool state = readDigitalInput(slot, ch);
+      Serial.print(ch);
+      Serial.print(":");
+      Serial.print(state ? "H" : "L");
+      Serial.print(" ");
+    }
+    Serial.println();
+  }
+  
+  // Test analog inputs
+  Serial.println("\nAnalog Input Status:");
+  for (int slot : analogSlots) {
+    Serial.print("Slot ");
+    Serial.print(slot);
+    Serial.println(":");
+    for (int ch = 0; ch < 4; ch++) {
+      uint16_t raw = P1.readAnalog(slot, ch);
+      float mA = ((raw / (float)analogMax) * 20.0);
+      Serial.print("  Ch");
+      Serial.print(ch);
+      Serial.print(": ");
+      Serial.print(raw);
+      Serial.print(" (");
+      Serial.print(mA, 2);
+      Serial.println(" mA)");
+    }
+  }
+  
+  // Network status
+  printNetworkInfo();
+  
+  Serial.println("Diagnostics complete.\n");
+}
+
+/**
+ * Heartbeat function for system monitoring
+ */
+void heartbeat() {
+  if (millis() - lastHeartbeat > 1000) {
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    lastHeartbeat = millis();
+    watchdogCounter++;
+    modbus.holdingRegisterWrite(REG_WATCHDOG, watchdogCounter);
+  }
+}
+
+// =====================================================
+// MAIN SETUP FUNCTION
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("P1AM Tank Control System v2.0 Starting...");
+  
+  // Initialize built-in LED for heartbeat
+  pinMode(LED_BUILTIN, OUTPUT);
+  
+  // Initialize P1AM system
+  Serial.println("Initializing P1AM modules...");
+  if (!P1.init()) {
+    Serial.println("FATAL ERROR: P1AM initialization failed!");
+    while (1) {
+      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+      delay(100); // Fast blink = fatal error
+    }
+  }
+  Serial.println("P1AM modules initialized successfully.");
+  
+  // Initialize Ethernet
+  Serial.println("Initializing Ethernet...");
+  Ethernet.begin(mac, ip);
+  ethServer.begin();
+  
+  // Wait for Ethernet to stabilize
+  delay(2000);
+  printNetworkInfo();
+  
+  // Initialize Modbus TCP server
+  Serial.println("Starting Modbus TCP Server...");
+  if (!modbus.begin()) {
+    Serial.println("FATAL ERROR: Failed to start Modbus TCP Server!");
+    while (1) {
+      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+      delay(200); // Medium blink = Modbus error
+    }
+  }
+  
+  // Configure Modbus registers
+  modbus.configureHoldingRegisters(REG_LEVEL_START, 30);    // Tank levels, flows, runtimes, etc.
+  modbus.configureInputRegisters(REG_MODE_STATUS, 10);      // Mode status and diagnostics
+  modbus.configureCoils(COIL_FILL_START, 20);              // Fill valves and pumps
+  modbus.configureDiscreteInputs(DISCRETE_HH_BASE, 30);    // HH switches and EPO
+  
+  Serial.println("Modbus TCP Server started successfully.");
+  Serial.println("System ready for operation.");
+  Serial.println("Send 'diag' to run diagnostics.");
+  Serial.println("==========================================\n");
+  
+  // Run initial diagnostics
+  runDiagnostics();
+  
+  lastHMIContact = millis(); // Initialize HMI contact timer
+}
+
+// =====================================================
+// MAIN LOOP FUNCTION
+// =====================================================
+void loop() {
+  // Handle serial commands
+  if (Serial.available()) {
+    String command = Serial.readString();
+    command.trim();
+    if (command == "diag") {
+      runDiagnostics();
+    }
+  }
+  
+  // Update heartbeat and watchdog
+  heartbeat();
+  
+  // Handle Modbus TCP clients
+  EthernetClient client = ethServer.available();
+  if (client) {
+    lastHMIContact = millis(); // Update HMI contact time
+    modbus.accept(client);
+  }
+  
+  // Perform safety checks
+  if (!performSafetyChecks()) {
+    handleEmergencyStop();
+    delay(100); // Slow down loop during fault
+    return;
+  }
+  
+  // =====================================================
+  // READ ALL INPUTS
+  // =====================================================
+  
+  float tankLevels[numTanks];
+  
+  // Read tank levels from analog inputs
+  for (int i = 0; i < numTanks; i++) {
+    int slot = analogSlots[i / 4]; // 4 channels per slot
+    int channel = i % 4;
+    
+    if (i < 4) {
+      // Tanks 1-4 on slot 1
+      slot = analogSlots[0];
+      channel = i;
+    } else {
+      // Tanks 5-9 on slot 2, channels 0-4
+      slot = analogSlots[1];
+      channel = i - 4;
+    }
+    
+    uint16_t raw = P1.readAnalog(slot, channel);
+    float levelPercent = scaleAnalogToPercent(raw);
+    
+    if (levelPercent >= 0) { // Valid reading
+      tankLevels[i] = levelPercent;
+      // Scale to 0-10000 for better resolution over Modbus
+      modbus.holdingRegisterWrite(REG_LEVEL_START + i, (uint16_t)(levelPercent * 100));
+    }
+  }
+  
+  // Read flow measurements
+  for (int i = 0; i < numFlows; i++) {
+    int slot = analogSlots[1]; // Slot 2
+    int channel = i + 5; // Channels 5-6 for flows (after tank 9)
+    
+    uint16_t raw = P1.readAnalog(slot, channel);
+    float flowGPM = scaleAnalogToFlow(raw);
+    
+    if (flowGPM >= 0) { // Valid reading
+      // Scale to 0-5000 for better resolution over Modbus
+      modbus.holdingRegisterWrite(REG_FLOW_START + i, (uint16_t)(flowGPM * 100));
+    }
+  }
+  
+  // Read High-High level switches
+  for (int i = 0; i < numTanks; i++) {
+    int slot = digitalInputSlots[i / 8]; // 8 inputs per slot
+    int channel = i % 8;
+    bool hh = readDigitalInput(slot, channel);
+    modbus.discreteInputWrite(DISCRETE_HH_BASE + i, hh);
+  }
+  
+  // Read tank EPO switches
+  for (int i = 0; i < numTanks; i++) {
+    int slot = digitalInputSlots[(i + 9) / 8]; // Offset by HH switches
+    int channel = (i + 9) % 8;
+    bool epo = readDigitalInput(slot, channel);
+    modbus.discreteInputWrite(DISCRETE_EPO_BASE + i, epo);
+  }
+  
+  // Read main EPO switch
+  bool mainEPO = readDigitalInput(digitalInputSlots[2], 0);
+  modbus.discreteInputWrite(DISCRETE_MAIN_EPO, mainEPO);
+  
+  // Read mode selector switches
+  bool modeOFF = readDigitalInput(digitalInputSlots[2], 1);
+  bool modeHAND = readDigitalInput(digitalInputSlots[2], 2);
+  bool modeAUTO = readDigitalInput(digitalInputSlots[2], 3);
+  
+  // Determine system mode
+  uint16_t modeValue = 0; // Default OFF
+  if (modeHAND && !modeAUTO) modeValue = 1;      // HAND mode
+  else if (modeAUTO && !modeHAND) modeValue = 2;  // AUTO mode
+  // If both or neither are active, stay in OFF mode
+  
+  modbus.inputRegisterWrite(REG_MODE_STATUS, modeValue);
+  
+  // Read pump control switches (for HAND mode)
+  bool pump1OnSwitch = readDigitalInput(digitalInputSlots[2], 4);
+  bool pump2OnSwitch = readDigitalInput(digitalInputSlots[2], 5);
+  bool pump1OffSwitch = readDigitalInput(digitalInputSlots[2], 6);
+  bool pump2OffSwitch = readDigitalInput(digitalInputSlots[2], 7);
+  
+  // =====================================================
+  // CONTROL LOGIC
+  // =====================================================
+  
+  // Check for emergency stop condition
+  if (mainEPO) {
+    handleEmergencyStop();
+    return; // Skip all other control logic
+  }
+  
+  // Initialize control variables
+  bool anyFilling = false;
+  bool pump1On = false;
+  bool pump2On = false;
+  
+  // AUTO MODE: Automatic tank filling logic
+  if (modeValue == 2) {
+    for (int i = 0; i < numTanks; i++) {
+      float level = tankLevels[i];
+      bool currentFilling = modbus.coilRead(COIL_FILL_START + i);
+      
+      // Start filling if level drops below threshold
+      if (level < FILL_START_THRESHOLD && !currentFilling) {
+        modbus.coilWrite(COIL_FILL_START + i, true);
+        Serial.print("AUTO: Started filling Tank ");
+        Serial.println(i + 1);
+      }
+      // Stop filling if level rises above threshold
+      else if (level > FILL_STOP_THRESHOLD && currentFilling) {
+        modbus.coilWrite(COIL_FILL_START + i, false);
+        Serial.print("AUTO: Stopped filling Tank ");
+        Serial.println(i + 1);
+      }
+    }
+  }
+  
+  // Process valve outputs and determine if any tanks are filling
+  for (int i = 0; i < numTanks; i++) {
+    bool valveCoil = modbus.coilRead(COIL_FILL_START + i);
+    
+    // Check for High-High override
+    bool hhSwitch = modbus.discreteInputRead(DISCRETE_HH_BASE + i);
+    if (hhSwitch) {
+      valveCoil = false; // Override - close valve on HH
+      modbus.coilWrite(COIL_FILL_START + i, false); // Clear the coil too
+    }
+    
+    // Control physical outputs
+    writeDigitalOutput(outputSlotValves, i + 2, valveCoil);
+    writeDigitalOutput(outputSlotGreenLights, i, valveCoil);
+    
+    if (valveCoil) anyFilling = true;
+  }
+  
+  // PUMP CONTROL LOGIC
+  if (modeValue == 1) {
+    // HAND MODE: Manual pump control
+    pump1On = pump1OnSwitch && !pump1OffSwitch;
+    pump2On = pump2OnSwitch && !pump2OffSwitch;
+  }
+  else if (modeValue == 2) {
+    // AUTO MODE: Automatic pump control with alternation
+    if (anyFilling) {
+      // Alternate lead pump every 60 seconds
+      if (millis() - lastPumpSwitchTime > pumpSwitchInterval) {
+        leadPumpIsPump1 = !leadPumpIsPump1;
+        lastPumpSwitchTime = millis();
+        Serial.print("AUTO: Switched lead pump to Pump ");
+        Serial.println(leadPumpIsPump1 ? "1" : "2");
+      }
+      
+      // Start lead pump (unless manually stopped)
+      if (leadPumpIsPump1) {
+        pump1On = !pump1OffSwitch; // Manual stop override
+        pump2On = false;
+      } else {
+        pump1On = false;
+        pump2On = !pump2OffSwitch; // Manual stop override
+      }
+    }
+    // If no tanks filling, turn off both pumps
+  }
+  // OFF MODE: Both pumps off (pump1On and pump2On remain false)
+  
+  // Apply pump outputs
+  writeDigitalOutput(outputSlotValves, 0, pump1On);
+  writeDigitalOutput(outputSlotValves, 1, pump2On);
+  
+  // Update Modbus coils to reflect actual pump states
+  modbus.coilWrite(COIL_PUMP_LEAD, pump1On);
+  modbus.coilWrite(COIL_PUMP_LAG, pump2On);
+  
+  // Update pump runtime tracking
+  updatePumpRuntime(pump1On, pump2On);
+  
+  // Main loop timing - 50ms cycle time
+  delay(50);
+}
