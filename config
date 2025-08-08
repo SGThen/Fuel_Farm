@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""
+Configuration constants for the Tank Level Control System
+"""
+
+import os
+
+class Config:
+    """System configuration constants"""
+    
+    # Network Configuration
+    PLC_IP = os.getenv("PLC_IP", "192.168.1.100")
+    PLC_PORT = int(os.getenv("PLC_PORT", "502"))
+    MODBUS_UNIT_ID = int(os.getenv("MODBUS_UNIT_ID", "1"))
+    MODBUS_TIMEOUT = int(os.getenv("MODBUS_TIMEOUT", "8"))
+    
+    # Communication Parameters
+    POLLING_INTERVAL = float(os.getenv("POLLING_INTERVAL", "1.5"))
+    MAX_RECONNECT_ATTEMPTS = int(os.getenv("MAX_RECONNECT_ATTEMPTS", "3"))
+    RECONNECT_DELAY = int(os.getenv("RECONNECT_DELAY", "3"))
+    
+    # System Parameters
+    NUM_TANKS = int(os.getenv("NUM_TANKS", "9"))
+    NUM_FLOWS = int(os.getenv("NUM_FLOWS", "2"))
+    
+    # Modbus Register Addresses (MUST MATCH PLC EXACTLY)
+    REG_LEVEL_START = 0         # Tank levels 0-8 (holding registers, scaled x100)
+    REG_FLOW_START = 10         # Flow readings 10-11 (holding registers, scaled x100)
+    REG_PUMP_RUNTIME1 = 22      # Pump 1 runtime (seconds)
+    REG_PUMP_RUNTIME2 = 23      # Pump 2 runtime (seconds)
+    REG_WATCHDOG = 24           # System watchdog counter
+    REG_SYSTEM_STATUS = 25      # System status flags
+    
+    # Input registers
+    INPUT_REG_MODE = 0          # System mode (0=OFF, 1=HAND, 2=AUTO)
+    INPUT_REG_FILLING = 1       # Filling status (0=none, 1=active)
+    INPUT_REG_PUMP1 = 2         # Pump 1 status (0=OFF, 1=ON)
+    INPUT_REG_PUMP2 = 3         # Pump 2 status (0=OFF, 1=ON)
+    
+    # Coils
+    COIL_FILL_START = 0         # Fill valve coils 0-8
+    COIL_PUMP_LEAD = 10         # Lead pump coil
+    COIL_PUMP_LAG = 11          # Lag pump coil
+    
+    # Discrete inputs
+    DISCRETE_HH_BASE = 0        # High-high switches 0-8
+    DISCRETE_EPO_BASE = 10      # Tank EPO switches 10-18
+    DISCRETE_MAIN_EPO = 20      # Main EPO switch
+    
+    # Tank Configuration
+    FILL_START_THRESHOLD = 30.0  # Start filling at 30%
+    FILL_STOP_THRESHOLD = 90.0   # Stop filling at 90%
+    
+    # Scaling Constants
+    MA_MIN = 4.0
+    MA_MAX = 20.0
+    LEVEL_MAX = 100.0
+    FLOW_MAX = 50.0
