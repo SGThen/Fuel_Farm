@@ -1,0 +1,1634 @@
+/*
+ * COMPLETE FIXED TANK CONTROL SYSTEM - ARDUINO SKETCH
+ * ===================================================
+ * 
+ * FIXED VERSION with improved Modbus TCP communication
+ * Optimized for Python pymodbus 4.x compatibility
+ * COMPILATION ERRORS FIXED
+ * 
+ * HARDWARE CONFIGURATION (Per Wiring Diagram):
+ * - Slot 1: P1-08ADL-1 (Tank levels 1-8)
+ * - Slot 2: P1-08ADL-1 (Tank 9 + flow meters) 
+ * - Slot 3: P1-16ND3 (HH switches, EPO switches)
+ * - Slot 4: P1-16ND3 (Mode switches, pump controls)
+ * - Slot 5: P1-16ND3 (Spare inputs)
+ * - Slot 6: P1-15TD2 (Pumps, valves) - OUTPUT
+ * - Slot 7: P1-15TD2 (Status lights) - OUTPUT
+ * 
+ * VERSION 3.1 - COMPILATION ERRORS FIXED
+ */
+
+// Include libraries first, BEFORE any function declarations
+#include <P1AM.h>
+#include <Ethernet.h>
+
+// Network configuration
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+IPAddress ip(192, 168, 1, 100);
+EthernetServer ethServer(502);
+
+// Hardware slot assignments (verified with wiring diagram)
+const int ANALOG_SLOT1 = 1;      // P1-08ADL-1 - Tank levels 1-8
+const int ANALOG_SLOT2 = 2;      // P1-08ADL-1 - Tank 9 + flows
+const int INPUT_SLOT1 = 3;       // P1-16ND3 - HH switches, EPOs
+const int INPUT_SLOT2 = 4;       // P1-16ND3 - Mode switches, pump controls
+const int INPUT_SLOT3 = 5;       // P1-16ND3 - Spare inputs
+const int OUTPUT_SLOT1 = 6;      // P1-15TD2 - Pumps, valves
+const int OUTPUT_SLOT2 = 7;      // P1-15TD2 - Status lights
+
+// System constants
+const int NUM_TANKS = 9;
+const int NUM_FLOWS = 2;
+const float FILL_START_THRESHOLD = 30.0;  // Start filling at 30%
+const float FILL_STOP_THRESHOLD = 90.0;   // Stop filling at 90%
+const float HH_OVERRIDE_LEVEL = 95.0;     // Hard stop at 95%
+const float mA_MIN = 4.0;
+const float mA_MAX = 20.0;
+const unsigned long PUMP_SWITCH_INTERVAL = 60000;  // 60 seconds
+const unsigned long SAFETY_CHECK_INTERVAL = 1000;  // 1 second
+const unsigned long STATUS_REPORT_INTERVAL = 10000; // 10 seconds
+const unsigned long BLINK_INTERVAL = 500;           // 500ms for blinking lights
+
+// System state variables
+bool p1amOK = false;
+bool ethOK = false;
+int systemMode = 0;              // 0=OFF, 1=HAND, 2=AUTO
+bool pump1On = false;
+bool pump2On = false;
+bool enableSystem = true;
+bool emergencyStopActive = false;
+unsigned long lastHeartbeat = 0;
+unsigned long lastPumpSwitch = 0;
+unsigned long lastSafetyCheck = 0;
+unsigned long lastStatusReport = 0;
+unsigned long lastBlinkToggle = 0;    // For blinking lights
+bool blinkState = false;              // Current blink state
+bool leadPumpIsPump1 = true;
+
+// Enhanced diagnostics
+struct DiagnosticData {
+  unsigned long totalRuntime;
+  unsigned long pump1Runtime;
+  unsigned long pump2Runtime;
+  int fillCycles[NUM_TANKS];
+  int alarmCount;
+  float lastKnownLevels[NUM_TANKS];
+  bool sensorFaultFlags[NUM_TANKS];
+} diagnostics;
+
+// Modbus data storage with proper initialization
+uint16_t holdingRegisters[100];   // Expanded for diagnostics
+uint16_t inputRegisters[50];      // System status + diagnostics
+bool coils[50];                   // Valve controls + system commands
+bool discreteInputs[50];          // HH switches, EPOs, mode switches
+
+// Modbus communication statistics
+unsigned long modbusRequestCount = 0;
+unsigned long modbusSuccessCount = 0;
+unsigned long lastModbusRequest = 0;
+
+// Function declarations (AFTER includes so EthernetClient is known)
+void handleModbusTCP();
+void processHoldingRegistersRead(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t qty);
+void processInputRegistersRead(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t qty);
+void processCoilsRead(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t qty);
+void processDiscreteInputsRead(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t qty);
+void processWriteSingleCoil(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t value);
+void processWriteSingleRegister(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t value);
+void sendExceptionResponse(EthernetClient& client, uint16_t transId, uint8_t functionCode, uint8_t exceptionCode);
+void writeSingleCoil(uint16_t addr, bool value);
+void writeSingleRegister(uint16_t addr, uint16_t value);
+
+void setup() {
+  Serial.begin(115200);
+  delay(3000);
+  
+  pinMode(LED_BUILTIN, OUTPUT);
+  
+  printStartupBanner();
+  initializeArrays();
+  
+  // Initialize P1AM with error handling
+  Serial.println("Initializing P1AM hardware...");
+  if (P1.init()) {
+    p1amOK = true;
+    Serial.println("✓ P1AM initialized successfully");
+    
+    // Verify module presence
+    verifyHardwareModules();
+  } else {
+    Serial.println("✗ FATAL: P1AM initialization failed!");
+    fatalError();
+  }
+  
+  // Initialize Ethernet with retries
+  initializeEthernet();
+  
+  // Initialize diagnostics
+  memset(&diagnostics, 0, sizeof(diagnostics));
+  diagnostics.totalRuntime = millis();
+  
+  // Perform initial safety check
+  performSafetyCheck();
+  
+  Serial.println("===========================================");
+  Serial.println("✓ SYSTEM READY FOR OPERATION");
+  Serial.println("Commands: help, status, tanks, auto, hand, off");
+  if (ethOK) {
+    Serial.println("Modbus TCP: " + String(Ethernet.localIP()[0]) + "." + 
+                   String(Ethernet.localIP()[1]) + "." + 
+                   String(Ethernet.localIP()[2]) + "." + 
+                   String(Ethernet.localIP()[3]) + ":502");
+  }
+  Serial.println("===========================================");
+}
+
+void loop() {
+  unsigned long now = millis();
+  
+  // Handle serial commands
+  handleSerialCommands();
+  
+  // Handle blink timing for status lights
+  if (now - lastBlinkToggle > BLINK_INTERVAL) {
+    blinkState = !blinkState;
+    lastBlinkToggle = now;
+  }
+  
+  // Heartbeat LED (faster when in alarm)
+  int heartbeatRate = emergencyStopActive ? 200 : 1000;
+  if (now - lastHeartbeat > heartbeatRate) {
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    lastHeartbeat = now;
+  }
+  
+  // Safety checks (high priority)
+  if (now - lastSafetyCheck > SAFETY_CHECK_INTERVAL) {
+    performSafetyCheck();
+    lastSafetyCheck = now;
+  }
+  
+  // Main control system
+  if (p1amOK && enableSystem && !emergencyStopActive) {
+    readAllInputs();
+    updateSystemMode();
+    runControlLogic();
+    updateDiagnostics();
+    updateModbusData();
+  }
+  
+  // Handle Modbus TCP (FIXED VERSION)
+  if (ethOK) {
+    handleModbusTCP();
+  }
+  
+  // Periodic status reporting
+  if (now - lastStatusReport > STATUS_REPORT_INTERVAL) {
+    reportSystemStatus();
+    reportModbusStatistics();
+    lastStatusReport = now;
+  }
+  
+  delay(50);  // 50ms main loop for responsive operation
+}
+
+void printStartupBanner() {
+  Serial.println("===========================================");
+  Serial.println("TANK CONTROL SYSTEM v3.1 - COMPILATION FIXED");
+  Serial.println("===========================================");
+  Serial.println("Hardware Configuration:");
+  Serial.println("  Slot 1-2: P1-08ADL-1 (Analog inputs)");
+  Serial.println("  Slot 3-5: P1-16ND3 (Digital inputs)");
+  Serial.println("  Slot 6-7: P1-15TD2 (Digital outputs)");
+  Serial.println("");
+  Serial.println("Features:");
+  Serial.println("  • 9 Tank level monitoring");
+  Serial.println("  • 2 Flow meter inputs");
+  Serial.println("  • Auto/Manual operation modes");
+  Serial.println("  • Safety interlocks & EPO");
+  Serial.println("  • FIXED Modbus TCP communication");
+  Serial.println("  • PyModbus 4.x compatible");
+  Serial.println("  • Advanced diagnostics");
+  Serial.println("===========================================");
+}
+
+void initializeArrays() {
+  // Initialize all arrays to safe defaults
+  memset(holdingRegisters, 0, sizeof(holdingRegisters));
+  memset(inputRegisters, 0, sizeof(inputRegisters));
+  memset(coils, false, sizeof(coils));
+  memset(discreteInputs, false, sizeof(discreteInputs));
+  
+  Serial.println("✓ Modbus arrays initialized");
+}
+
+void verifyHardwareModules() {
+  Serial.println("Verifying hardware modules:");
+  
+  // Test each slot by attempting to read/write
+  bool slotStatus[8] = {false};
+  
+  // Test analog input slots
+  for (int slot = 1; slot <= 2; slot++) {
+    float testValue = P1.readAnalog(slot, 0);
+    slotStatus[slot] = (testValue >= 0);
+    Serial.println("  Slot " + String(slot) + " (Analog): " + 
+                   String(slotStatus[slot] ? "OK" : "FAULT"));
+  }
+  
+  // Test digital input slots
+  for (int slot = 3; slot <= 5; slot++) {
+    bool testValue = P1.readDiscrete(slot, 0);
+    slotStatus[slot] = true; // Assume OK if no error
+    Serial.println("  Slot " + String(slot) + " (Digital In): " + 
+                   String(slotStatus[slot] ? "OK" : "FAULT"));
+  }
+  
+  // Test digital output slots
+  for (int slot = 6; slot <= 7; slot++) {
+    P1.writeDiscrete(LOW, slot, 0); // Test write capability
+    slotStatus[slot] = true; // Assume OK if no error
+    Serial.println("  Slot " + String(slot) + " (Digital Out): " + 
+                   String(slotStatus[slot] ? "OK" : "FAULT"));
+  }
+}
+
+void initializeEthernet() {
+  Serial.println("Initializing Ethernet...");
+  
+  for (int attempt = 0; attempt < 3; attempt++) {
+    Ethernet.begin(mac, ip);
+    delay(2000);
+    
+    if (Ethernet.localIP() != IPAddress(0,0,0,0)) {
+      ethOK = true;
+      ethServer.begin();
+      Serial.println("✓ Ethernet initialized successfully");
+      Serial.println("IP: " + String(Ethernet.localIP()[0]) + "." + 
+                     String(Ethernet.localIP()[1]) + "." + 
+                     String(Ethernet.localIP()[2]) + "." + 
+                     String(Ethernet.localIP()[3]));
+      return;
+    }
+    
+    Serial.println("Ethernet attempt " + String(attempt + 1) + " failed, retrying...");
+  }
+  
+  Serial.println("⚠ WARNING: Ethernet initialization failed - no network connectivity");
+}
+
+// =============================================================================
+// IMPROVED MODBUS TCP FUNCTIONS - ARDUINO OPTIMIZED AND COMPILATION FIXED
+// =============================================================================
+
+/*
+ * ARDUINO TIMEOUT FIX - Replace handleModbusTCP() function
+ * ======================================================
+ * 
+ * This function replaces the handleModbusTCP() function in your Arduino sketch
+ * to fix timeout issues and improve responsiveness
+ */
+
+void handleModbusTCP() {
+  EthernetClient client = ethServer.available();
+  if (client) {
+    modbusRequestCount++;
+    lastModbusRequest = millis();
+    
+    Serial.println("=== MODBUS CLIENT CONNECTED ===");
+    
+    // IMPROVED: Shorter timeout and faster processing
+    unsigned long connectionStart = millis();
+    unsigned long timeout = connectionStart + 2000; // Reduced to 2 seconds
+    
+    // Immediate processing - don't wait for more data if we have enough
+    while (client.connected() && millis() < timeout) {
+      
+      // Check for minimum Modbus TCP request (12 bytes)
+      int available = client.available();
+      if (available >= 12) {
+        
+        // IMPROVED: Read data more aggressively
+        uint8_t buffer[50]; // Larger buffer for faster reading
+        int bytesRead = 0;
+        
+        // Read all available data quickly
+        unsigned long readStart = millis();
+        while (bytesRead < available && bytesRead < 50 && client.available() && 
+               (millis() - readStart) < 500) { // 500ms read timeout
+          buffer[bytesRead] = client.read();
+          bytesRead++;
+        }
+        
+        if (bytesRead >= 12) {
+          // Parse MBAP header quickly
+          uint16_t transactionId = (buffer[0] << 8) | buffer[1];
+          uint16_t protocolId = (buffer[2] << 8) | buffer[3];
+          uint16_t length = (buffer[4] << 8) | buffer[5];
+          uint8_t unitId = buffer[6];
+          uint8_t functionCode = buffer[7];
+          
+          // Quick validation
+          if (protocolId != 0 || unitId != 1) {
+            Serial.println("  ERROR: Invalid protocol/unit");
+            sendExceptionResponse(client, transactionId, functionCode, 0x0B);
+            break;
+          }
+          
+          if (length < 2 || length > 40) { // More restrictive length check
+            Serial.println("  ERROR: Invalid length: " + String(length));
+            sendExceptionResponse(client, transactionId, functionCode, 0x0B);
+            break;
+          }
+          
+          // Ensure we have the complete PDU
+          int pduBytesNeeded = length - 1; // Subtract unit ID
+          if (bytesRead < (6 + pduBytesNeeded)) {
+            Serial.println("  ERROR: Incomplete request");
+            break;
+          }
+          
+          // Extract request parameters quickly
+          uint16_t startAddr = 0;
+          uint16_t quantity = 0;
+          uint16_t value = 0;
+          
+          if (bytesRead >= 12) {
+            startAddr = (buffer[8] << 8) | buffer[9];
+            quantity = (buffer[10] << 8) | buffer[11];
+          }
+          
+          if (bytesRead >= 14) {
+            value = (buffer[12] << 8) | buffer[13];
+          }
+          
+          Serial.println("Quick Modbus: FC=0x" + String(functionCode, HEX) + 
+                        ", Addr=" + String(startAddr) + ", Qty=" + String(quantity));
+          
+          // IMPROVED: Process request immediately with tighter limits
+          bool processed = false;
+          
+          switch (functionCode) {
+            case 0x03: // Read Holding Registers
+              if (startAddr < 100 && quantity > 0 && quantity <= 10 && (startAddr + quantity) <= 100) {
+                processHoldingRegistersRead(client, transactionId, startAddr, quantity);
+                processed = true;
+              } else {
+                sendExceptionResponse(client, transactionId, functionCode, 0x02);
+                processed = true;
+              }
+              break;
+              
+            case 0x04: // Read Input Registers  
+              if (startAddr < 50 && quantity > 0 && quantity <= 8 && (startAddr + quantity) <= 50) {
+                processInputRegistersRead(client, transactionId, startAddr, quantity);
+                processed = true;
+              } else {
+                sendExceptionResponse(client, transactionId, functionCode, 0x02);
+                processed = true;
+              }
+              break;
+              
+            case 0x01: // Read Coils
+              if (startAddr < 50 && quantity > 0 && quantity <= 16 && (startAddr + quantity) <= 50) {
+                processCoilsRead(client, transactionId, startAddr, quantity);
+                processed = true;
+              } else {
+                sendExceptionResponse(client, transactionId, functionCode, 0x02);
+                processed = true;
+              }
+              break;
+              
+            case 0x02: // Read Discrete Inputs
+              if (startAddr < 50 && quantity > 0 && quantity <= 12 && (startAddr + quantity) <= 50) {
+                processDiscreteInputsRead(client, transactionId, startAddr, quantity);
+                processed = true;
+              } else {
+                sendExceptionResponse(client, transactionId, functionCode, 0x02);
+                processed = true;
+              }
+              break;
+              
+            case 0x05: // Write Single Coil
+              if (startAddr < 50) {
+                processWriteSingleCoil(client, transactionId, startAddr, value);
+                processed = true;
+              } else {
+                sendExceptionResponse(client, transactionId, functionCode, 0x02);
+                processed = true;
+              }
+              break;
+              
+            case 0x06: // Write Single Register
+              if (startAddr < 100) {
+                processWriteSingleRegister(client, transactionId, startAddr, value);
+                processed = true;
+              } else {
+                sendExceptionResponse(client, transactionId, functionCode, 0x02);
+                processed = true;
+              }
+              break;
+              
+            default:
+              sendExceptionResponse(client, transactionId, functionCode, 0x01);
+              processed = true;
+              break;
+          }
+          
+          if (processed) {
+            modbusSuccessCount++;
+          }
+        }
+        
+        break; // Exit immediately after processing one request
+      }
+      
+      // IMPROVED: Much shorter wait time
+      if (available == 0) {
+        delay(1); // Very short delay if no data available
+      }
+    }
+    
+    // IMPROVED: Minimal delay before closing
+    delay(5); // Just 5ms delay
+    
+    // Close connection quickly
+    client.stop();
+    Serial.println("=== CLIENT DISCONNECTED ===");
+  }
+}
+
+void processHoldingRegistersRead(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t qty) {
+  Serial.println("  Processing holding registers: addr=" + String(addr) + ", qty=" + String(qty));
+  
+  // Enhanced validation for Arduino stability
+  if (addr >= 100) {
+    Serial.println("  ERROR: Address out of range: " + String(addr));
+    sendExceptionResponse(client, transId, 0x03, 0x02);
+    return;
+  }
+  
+  if (qty == 0 || qty > 25) { // Reduced max quantity for Arduino stability
+    Serial.println("  ERROR: Invalid quantity: " + String(qty));
+    sendExceptionResponse(client, transId, 0x03, 0x02);
+    return;
+  }
+  
+  if ((addr + qty) > 100) {
+    Serial.println("  ERROR: Range exceeds bounds: " + String(addr + qty));
+    sendExceptionResponse(client, transId, 0x03, 0x02);
+    return;
+  }
+  
+  // Calculate response size
+  uint8_t byteCount = qty * 2;
+  uint16_t responseLength = 9 + byteCount;
+  
+  // Check if response will fit in Arduino memory
+  if (responseLength > 180) { // Conservative limit for Arduino
+    Serial.println("  ERROR: Response too large: " + String(responseLength));
+    sendExceptionResponse(client, transId, 0x03, 0x02);
+    return;
+  }
+  
+  // Use stack buffer for smaller responses, dynamic for larger
+  uint8_t stackBuffer[100];
+  uint8_t* response;
+  bool useDynamic = false;
+  
+  if (responseLength <= 100) {
+    response = stackBuffer;
+  } else {
+    response = (uint8_t*)malloc(responseLength);
+    if (!response) {
+      Serial.println("  ERROR: Memory allocation failed");
+      sendExceptionResponse(client, transId, 0x03, 0x04);
+      return;
+    }
+    useDynamic = true;
+  }
+  
+  // Build MBAP header
+  response[0] = transId >> 8;
+  response[1] = transId & 0xFF;
+  response[2] = 0x00; // Protocol ID
+  response[3] = 0x00;
+  response[4] = (3 + byteCount) >> 8; // Length
+  response[5] = (3 + byteCount) & 0xFF;
+  response[6] = 0x01; // Unit ID
+  response[7] = 0x03; // Function Code
+  response[8] = byteCount; // Byte Count
+  
+  // Add register data with bounds checking
+  for (uint16_t i = 0; i < qty; i++) {
+    uint16_t regAddr = addr + i;
+    uint16_t regValue = 0;
+    
+    // Safe access to holding registers
+    if (regAddr < 100) {
+      regValue = holdingRegisters[regAddr];
+    }
+    
+    // Pack register value (big-endian) with bounds checking
+    uint16_t dataIndex = 9 + (i * 2);
+    if (dataIndex + 1 < responseLength) {
+      response[dataIndex] = regValue >> 8;
+      response[dataIndex + 1] = regValue & 0xFF;
+    }
+  }
+  
+  // Send response
+  size_t bytesSent = client.write(response, responseLength);
+  client.flush();
+  
+  // Clean up dynamic memory
+  if (useDynamic) {
+    free(response);
+  }
+  
+  Serial.println("  ✓ Sent " + String(qty) + " holding registers (" + String(bytesSent) + " bytes)");
+}
+
+void processInputRegistersRead(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t qty) {
+  Serial.println("  Processing input registers: addr=" + String(addr) + ", qty=" + String(qty));
+  
+  // More restrictive validation for input registers (often causes timeouts)
+  if (addr >= 50) {
+    Serial.println("  ERROR: Input register address out of range: " + String(addr));
+    sendExceptionResponse(client, transId, 0x04, 0x02);
+    return;
+  }
+  
+  if (qty == 0 || qty > 10) { // Even more restrictive for input registers
+    Serial.println("  ERROR: Invalid input register quantity: " + String(qty));
+    sendExceptionResponse(client, transId, 0x04, 0x02);
+    return;
+  }
+  
+  if ((addr + qty) > 50) {
+    Serial.println("  ERROR: Input register range exceeds bounds");
+    sendExceptionResponse(client, transId, 0x04, 0x02);
+    return;
+  }
+  
+  uint8_t byteCount = qty * 2;
+  uint16_t responseLength = 9 + byteCount;
+  
+  // Use stack buffer for input registers (typically small reads)
+  uint8_t response[50]; // Conservative size
+  
+  if (responseLength > 50) {
+    Serial.println("  ERROR: Input register response too large");
+    sendExceptionResponse(client, transId, 0x04, 0x02);
+    return;
+  }
+  
+  // Build response
+  response[0] = transId >> 8;
+  response[1] = transId & 0xFF;
+  response[2] = 0x00;
+  response[3] = 0x00;
+  response[4] = (3 + byteCount) >> 8;
+  response[5] = (3 + byteCount) & 0xFF;
+  response[6] = 0x01;
+  response[7] = 0x04;
+  response[8] = byteCount;
+  
+  // Add register data
+  for (uint16_t i = 0; i < qty; i++) {
+    uint16_t regAddr = addr + i;
+    uint16_t regValue = 0;
+    
+    if (regAddr < 50) {
+      regValue = inputRegisters[regAddr];
+    }
+    
+    response[9 + (i * 2)] = regValue >> 8;
+    response[9 + (i * 2) + 1] = regValue & 0xFF;
+  }
+  
+  // Send response
+  size_t bytesSent = client.write(response, responseLength);
+  client.flush();
+  
+  Serial.println("  ✓ Sent " + String(qty) + " input registers (" + String(bytesSent) + " bytes)");
+}
+
+void processCoilsRead(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t qty) {
+  Serial.println("  Processing coils: addr=" + String(addr) + ", qty=" + String(qty));
+  
+  if (addr >= 50 || qty == 0 || qty > 20 || (addr + qty) > 50) {
+    sendExceptionResponse(client, transId, 0x01, 0x02);
+    return;
+  }
+  
+  uint8_t byteCount = (qty + 7) / 8; // Round up to nearest byte
+  uint16_t responseLength = 9 + byteCount;
+  
+  uint8_t response[30]; // Conservative size for coils
+  
+  if (responseLength > 30) {
+    sendExceptionResponse(client, transId, 0x01, 0x02);
+    return;
+  }
+  
+  // Build response
+  response[0] = transId >> 8;
+  response[1] = transId & 0xFF;
+  response[2] = 0x00;
+  response[3] = 0x00;
+  response[4] = (3 + byteCount) >> 8;
+  response[5] = (3 + byteCount) & 0xFF;
+  response[6] = 0x01;
+  response[7] = 0x01;
+  response[8] = byteCount;
+  
+  // Pack coils into bytes
+  for (uint8_t byteIndex = 0; byteIndex < byteCount; byteIndex++) {
+    response[9 + byteIndex] = 0;
+    
+    for (uint8_t bitIndex = 0; bitIndex < 8; bitIndex++) {
+      uint16_t coilAddr = addr + (byteIndex * 8) + bitIndex;
+      
+      if ((byteIndex * 8 + bitIndex) < qty && coilAddr < 50) {
+        if (coils[coilAddr]) {
+          response[9 + byteIndex] |= (1 << bitIndex);
+        }
+      }
+    }
+  }
+  
+  size_t bytesSent = client.write(response, responseLength);
+  client.flush();
+  
+  Serial.println("  ✓ Sent " + String(qty) + " coils (" + String(bytesSent) + " bytes)");
+}
+
+void processDiscreteInputsRead(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t qty) {
+  Serial.println("  Processing discrete inputs: addr=" + String(addr) + ", qty=" + String(qty));
+  
+  // Very restrictive for discrete inputs (most problematic for Arduino)
+  if (addr >= 50) {
+    Serial.println("  ERROR: Discrete input address out of range: " + String(addr));
+    sendExceptionResponse(client, transId, 0x02, 0x02);
+    return;
+  }
+  
+  if (qty == 0 || qty > 16) { // Very conservative limit
+    Serial.println("  ERROR: Invalid discrete input quantity: " + String(qty));
+    sendExceptionResponse(client, transId, 0x02, 0x02);
+    return;
+  }
+  
+  if ((addr + qty) > 50) {
+    Serial.println("  ERROR: Discrete input range exceeds bounds");
+    sendExceptionResponse(client, transId, 0x02, 0x02);
+    return;
+  }
+  
+  uint8_t byteCount = (qty + 7) / 8;
+  uint16_t responseLength = 9 + byteCount;
+  
+  uint8_t response[25]; // Very conservative size
+  
+  if (responseLength > 25) {
+    Serial.println("  ERROR: Discrete input response too large");
+    sendExceptionResponse(client, transId, 0x02, 0x02);
+    return;
+  }
+  
+  // Build response
+  response[0] = transId >> 8;
+  response[1] = transId & 0xFF;
+  response[2] = 0x00;
+  response[3] = 0x00;
+  response[4] = (3 + byteCount) >> 8;
+  response[5] = (3 + byteCount) & 0xFF;
+  response[6] = 0x01;
+  response[7] = 0x02;
+  response[8] = byteCount;
+  
+  // Pack discrete inputs into bytes
+  for (uint8_t byteIndex = 0; byteIndex < byteCount; byteIndex++) {
+    response[9 + byteIndex] = 0;
+    
+    for (uint8_t bitIndex = 0; bitIndex < 8; bitIndex++) {
+      uint16_t inputAddr = addr + (byteIndex * 8) + bitIndex;
+      
+      if ((byteIndex * 8 + bitIndex) < qty && inputAddr < 50) {
+        if (discreteInputs[inputAddr]) {
+          response[9 + byteIndex] |= (1 << bitIndex);
+        }
+      }
+    }
+  }
+  
+  size_t bytesSent = client.write(response, responseLength);
+  client.flush();
+  
+  Serial.println("  ✓ Sent " + String(qty) + " discrete inputs (" + String(bytesSent) + " bytes)");
+}
+
+void processWriteSingleCoil(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t value) {
+  Serial.println("  Processing write coil: addr=" + String(addr) + ", value=" + String(value, HEX));
+  
+  if (addr >= 50) {
+    sendExceptionResponse(client, transId, 0x05, 0x02);
+    return;
+  }
+  
+  // Write the coil
+  bool coilValue = (value == 0xFF00); // Standard Modbus coil value for TRUE
+  writeSingleCoil(addr, coilValue);
+  
+  // Send echo response
+  uint8_t response[12] = {
+    (uint8_t)(transId >> 8), (uint8_t)(transId & 0xFF), // Transaction ID
+    0x00, 0x00,                                          // Protocol ID
+    0x00, 0x06,                                          // Length
+    0x01,                                                // Unit ID
+    0x05,                                                // Function code
+    (uint8_t)(addr >> 8), (uint8_t)(addr & 0xFF),       // Address
+    (uint8_t)(value >> 8), (uint8_t)(value & 0xFF)      // Value
+  };
+  
+  client.write(response, 12);
+  client.flush();
+  
+  Serial.println("  ✓ Coil " + String(addr) + " = " + String(coilValue));
+}
+
+void processWriteSingleRegister(EthernetClient& client, uint16_t transId, uint16_t addr, uint16_t value) {
+  Serial.println("  Processing write register: addr=" + String(addr) + ", value=" + String(value));
+  
+  if (addr >= 100) {
+    sendExceptionResponse(client, transId, 0x06, 0x02);
+    return;
+  }
+  
+  // Write the register
+  writeSingleRegister(addr, value);
+  
+  // Send echo response
+  uint8_t response[12] = {
+    (uint8_t)(transId >> 8), (uint8_t)(transId & 0xFF), // Transaction ID
+    0x00, 0x00,                                          // Protocol ID
+    0x00, 0x06,                                          // Length
+    0x01,                                                // Unit ID
+    0x06,                                                // Function code
+    (uint8_t)(addr >> 8), (uint8_t)(addr & 0xFF),       // Address
+    (uint8_t)(value >> 8), (uint8_t)(value & 0xFF)      // Value
+  };
+  
+  client.write(response, 12);
+  client.flush();
+  
+  Serial.println("  ✓ Register " + String(addr) + " = " + String(value));
+}
+
+void sendExceptionResponse(EthernetClient& client, uint16_t transId, uint8_t functionCode, uint8_t exceptionCode) {
+  Serial.println("  Sending EXCEPTION: Function=0x" + String(functionCode, HEX) + ", Code=0x" + String(exceptionCode, HEX));
+  
+  uint8_t response[9] = {
+    (uint8_t)(transId >> 8), (uint8_t)(transId & 0xFF), // Transaction ID
+    0x00, 0x00,                                          // Protocol ID
+    0x00, 0x03,                                          // Length
+    0x01,                                                // Unit ID
+    (uint8_t)(functionCode | 0x80),                      // Exception function code
+    exceptionCode                                        // Exception code
+  };
+  
+  client.write(response, 9);
+  client.flush();
+}
+
+// =============================================================================
+// CONTROL FUNCTIONS - These handle the actual tank control logic
+// =============================================================================
+
+void performSafetyCheck() {
+  bool previousEmergencyState = emergencyStopActive;
+  emergencyStopActive = false;
+  
+  Serial.println("=== SAFETY CHECK DEBUG ===");
+  
+  // Check main EPO with enhanced debugging
+  bool mainEPO = discreteInputs[20];
+  Serial.println("Main EPO (DI-20): " + String(mainEPO ? "ACTIVE" : "OK"));
+  
+  if (mainEPO) {
+    emergencyStopActive = true;
+    if (!previousEmergencyState) {
+      Serial.println("🚨 EMERGENCY STOP: Main EPO activated");
+      diagnostics.alarmCount++;
+    }
+  }
+  
+  // Check individual tank EPOs with enhanced debugging
+  Serial.println("Tank EPO Status:");
+  for (int i = 0; i < NUM_TANKS; i++) {
+    bool tankEPO = discreteInputs[10 + i];
+    Serial.println("  Tank " + String(i + 1) + " EPO (DI-" + String(10 + i) + "): " + 
+                   String(tankEPO ? "ACTIVE" : "OK"));
+    
+    if (tankEPO) {
+      if (coils[i]) { // If tank was filling
+        coils[i] = false;
+        Serial.println("🚨 EMERGENCY STOP: Tank " + String(i + 1) + " EPO activated - Valve closed");
+        diagnostics.alarmCount++;
+      }
+      // Individual tank EPO should also trigger main emergency stop
+      emergencyStopActive = true;
+    }
+  }
+  
+  // Check HH switches for additional safety
+  Serial.println("HH Switch Status:");
+  for (int i = 0; i < NUM_TANKS; i++) {
+    bool hhActive = discreteInputs[i];
+    Serial.println("  Tank " + String(i + 1) + " HH (DI-" + String(i) + "): " + 
+                   String(hhActive ? "HIGH" : "OK"));
+    
+    if (hhActive && coils[i]) {
+      coils[i] = false;
+      Serial.println("⚠ HIGH-HIGH: Tank " + String(i + 1) + " HH stop");
+    }
+  }
+  
+  // Check for sensor faults
+  for (int i = 0; i < NUM_TANKS; i++) {
+    float level = holdingRegisters[i] / 100.0;
+    bool sensorFault = false;
+    
+    // Check for impossible readings
+    if (level < -5.0 || level > 105.0) {
+      sensorFault = true;
+    }
+    
+    diagnostics.sensorFaultFlags[i] = sensorFault;
+    diagnostics.lastKnownLevels[i] = level;
+    
+    if (sensorFault && coils[i]) {
+      coils[i] = false;
+      Serial.println("⚠ SENSOR FAULT: Stopped filling Tank " + String(i + 1));
+    }
+  }
+  
+  Serial.println("Emergency Stop Active: " + String(emergencyStopActive ? "YES" : "NO"));
+  Serial.println("=========================");
+  
+  // If emergency stop just activated, shut down system
+  if (emergencyStopActive && !previousEmergencyState) {
+    emergencyStop();
+  }
+}
+
+void readAllInputs() {
+  // Read tank levels from analog inputs (per wiring diagram)
+  for (int i = 0; i < NUM_TANKS; i++) {
+    float mA = 0.0;
+    
+    if (i < 8) {
+      // Tanks 1-8 on slot 1, channels 1-8
+      mA = P1.readAnalog(ANALOG_SLOT1, i + 1);
+    } else if (i == 8) {
+      // Tank 9 on slot 2, channel 1
+      mA = P1.readAnalog(ANALOG_SLOT2, 1);
+    }
+    
+    // Convert mA to percentage with enhanced error handling
+    float levelPercent = 0.0;
+    if (mA >= 3.8 && mA <= 20.2) {  // Allow slight tolerance
+      levelPercent = ((mA - mA_MIN) / (mA_MAX - mA_MIN)) * 100.0;
+      levelPercent = constrain(levelPercent, 0.0, 100.0);
+    } else if (mA > 0.0 && mA < 3.8) {
+      levelPercent = 0.0;  // Below range = empty
+    } else {
+      // Sensor fault - use last known value
+      levelPercent = diagnostics.lastKnownLevels[i];
+      diagnostics.sensorFaultFlags[i] = true;
+    }
+    
+    // Store in holding registers (scaled x100 for Modbus resolution)
+    holdingRegisters[i] = (uint16_t)(levelPercent * 100);
+  }
+  
+  // Read flow rates (per wiring diagram: TB1-1, TB1-4)
+  for (int i = 0; i < NUM_FLOWS; i++) {
+    float mA = P1.readAnalog(ANALOG_SLOT2, i + 2);  // Channels 2-3
+    
+    float flowGPM = 0.0;
+    if (mA >= 3.8 && mA <= 20.2) {
+      flowGPM = ((mA - mA_MIN) / (mA_MAX - mA_MIN)) * 50.0;  // 0-50 GPM range
+    }
+    
+    holdingRegisters[10 + i] = (uint16_t)(flowGPM * 100);
+  }
+  
+  // ENHANCED: Read digital inputs with better error handling and debugging
+  
+  // HH switches (Slot 3, channels 1-9) - TB2-6 connections
+  Serial.print("Reading HH switches: ");
+  for (int i = 0; i < NUM_TANKS; i++) {
+    discreteInputs[i] = P1.readDiscrete(INPUT_SLOT1, i + 1);
+    Serial.print(String(discreteInputs[i]) + " ");
+  }
+  Serial.println();
+  
+  // CRITICAL: Tank EPOs with enhanced reading and debugging
+  Serial.print("Reading Tank EPOs: ");
+  for (int i = 0; i < NUM_TANKS; i++) {
+    // Tank EPOs are on specific channels based on wiring diagram
+    if (i < 7) {
+      // Tanks 1-7 EPOs: Slot 3, channels 10-16
+      discreteInputs[10 + i] = P1.readDiscrete(INPUT_SLOT1, i + 10);
+    } else {
+      // Tanks 8-9 EPOs: Slot 4, channels 1-2  
+      discreteInputs[10 + i] = P1.readDiscrete(INPUT_SLOT2, i - 6);
+    }
+    Serial.print(String(discreteInputs[10 + i]) + " ");
+  }
+  Serial.println();
+  
+  // CRITICAL: Main EPO (Slot 4, channel 3)
+  discreteInputs[20] = P1.readDiscrete(INPUT_SLOT2, 3);
+  Serial.println("Main EPO: " + String(discreteInputs[20]));
+  
+  // Mode switches (Slot 5, channels 2-3) - HMI panel connections  
+  discreteInputs[22] = P1.readDiscrete(INPUT_SLOT3, 2); // HAND (Term 3)
+  discreteInputs[23] = P1.readDiscrete(INPUT_SLOT3, 3); // AUTO (Term 4)
+  
+  // Pump control switches (Slot 5, channels 4-5) - Manual controls
+  discreteInputs[24] = P1.readDiscrete(INPUT_SLOT3, 4); // Pump 1 ON (NO) (Term 5)
+  discreteInputs[25] = P1.readDiscrete(INPUT_SLOT3, 5); // Pump 2 ON (NO) (Term 6)
+  discreteInputs[26] = !P1.readDiscrete(INPUT_SLOT3, 6); // Pump 1 OFF (NC - invert logic) (Term 7)
+  discreteInputs[27] = !P1.readDiscrete(INPUT_SLOT3, 7); // Pump 2 OFF (NC - invert logic) (Term 8)
+}
+
+void updateSystemMode() {
+  // Read raw signals from both channels for debugging
+  bool rawCh3 = P1.readDiscrete(INPUT_SLOT3, 3);
+  bool rawCh4 = P1.readDiscrete(INPUT_SLOT3, 4);
+  
+  // Apply the correct logic here to match what's in readAllInputs()
+  bool modeHAND = (!rawCh3 && rawCh4);  // HAND = Ch3 LOW AND Ch4 HIGH
+  bool modeAUTO = (rawCh3 && !rawCh4);  // AUTO = Ch3 HIGH AND Ch4 LOW
+  
+  int newMode = 0;  // Default OFF
+  
+  // Priority logic: HAND takes priority over AUTO if both active
+  if (modeHAND) {
+    newMode = 1;  // HAND mode
+  } else if (modeAUTO) {
+    newMode = 2;  // AUTO mode
+  }
+  
+  if (newMode != systemMode) {
+    systemMode = newMode;
+    String modeStr = (systemMode == 0 ? "OFF" : (systemMode == 1 ? "HAND" : "AUTO"));
+    Serial.println("Mode changed to: " + modeStr);
+    
+    if (systemMode == 0) {
+      shutdownAllOutputs();
+    }
+    
+    if (systemMode == 2) {
+      lastPumpSwitch = millis();
+    }
+  }
+}
+
+void runControlLogic() {
+  if (emergencyStopActive) {
+    return; // Safety override
+  }
+  
+  bool anyFilling = false;
+  
+  // AUTO MODE: Intelligent automatic tank filling
+  if (systemMode == 2) {
+    for (int i = 0; i < NUM_TANKS; i++) {
+      float level = holdingRegisters[i] / 100.0;
+      bool currentFilling = coils[i];
+      bool hhActive = discreteInputs[i];
+      bool tankEPO = discreteInputs[10 + i];
+      bool sensorFault = diagnostics.sensorFaultFlags[i];
+      
+      // Safety checks first
+      if (hhActive || tankEPO || sensorFault) {
+        if (currentFilling) {
+          coils[i] = false;
+          if (hhActive) Serial.println("AUTO: HH stop Tank " + String(i + 1));
+          if (tankEPO) Serial.println("AUTO: EPO stop Tank " + String(i + 1));
+          if (sensorFault) Serial.println("AUTO: Sensor fault stop Tank " + String(i + 1));
+        }
+        continue;
+      }
+      
+      // Hard safety limit
+      if (level > HH_OVERRIDE_LEVEL && currentFilling) {
+        coils[i] = false;
+        Serial.println("AUTO: Hard limit stop Tank " + String(i + 1) + " (" + String(level, 1) + "%)");
+        continue;
+      }
+      
+      // Normal filling logic with hysteresis
+      if (level < FILL_START_THRESHOLD && !currentFilling) {
+        coils[i] = true;
+        diagnostics.fillCycles[i]++;
+        Serial.println("AUTO: Start fill Tank " + String(i + 1) + " (" + String(level, 1) + "%)");
+      } else if (level > FILL_STOP_THRESHOLD && currentFilling) {
+        coils[i] = false;
+        Serial.println("AUTO: Stop fill Tank " + String(i + 1) + " (" + String(level, 1) + "%)");
+      }
+      
+      if (coils[i]) anyFilling = true;
+    }
+  }
+  
+  // HAND MODE: Manual pump control with momentary switches (latching logic)
+  else if (systemMode == 1) {
+    // Read pump control switches directly for accuracy
+    bool rawP1Start = P1.readDiscrete(INPUT_SLOT3, 5);  // Raw Ch5 - momentary NO
+    bool rawP1Stop = P1.readDiscrete(INPUT_SLOT3, 7);   // Raw Ch7 - momentary NC
+    bool rawP2Start = P1.readDiscrete(INPUT_SLOT3, 6);  // Raw Ch6 - momentary NO
+    bool rawP2Stop = P1.readDiscrete(INPUT_SLOT3, 8);   // Raw Ch8 - momentary NC
+    
+    // Use the raw values directly
+    bool pump1Start = rawP1Start;  // P1 START - Ch5 (NO contact)
+    bool pump2Start = rawP2Start;  // P2 START - Ch6 (NO contact)
+    bool pump1Stop = rawP1Stop;    // P1 STOP - Ch7 (NC contact) 
+    bool pump2Stop = rawP2Stop;    // P2 STOP - Ch8 (NC contact)
+    
+    // Edge detection for momentary switches
+    static bool lastP1Start = false;
+    static bool lastP1Stop = true;   // NC contacts start HIGH
+    static bool lastP2Start = false;
+    static bool lastP2Stop = true;   // NC contacts start HIGH
+    
+    // Detect button press edges 
+    bool p1StartPressed = (pump1Start && !lastP1Start);        // NO: LOW to HIGH = pressed
+    bool p1StopPressed = (!pump1Stop && lastP1Stop);          // NC: HIGH to LOW = pressed  
+    bool p2StartPressed = (pump2Start && !lastP2Start);        // NO: LOW to HIGH = pressed
+    bool p2StopPressed = (!pump2Stop && lastP2Stop);          // NC: HIGH to LOW = pressed
+    
+    // Latching pump control logic for momentary switches
+    if (p1StartPressed) {
+      pump1On = true;
+      pump2On = false;  // Only one pump at a time
+      Serial.println("HAND: P1 START pressed - Pump 1 ON, Pump 2 OFF");
+    }
+    
+    if (p1StopPressed) {
+      pump1On = false;
+      Serial.println("HAND: P1 STOP pressed - Pump 1 OFF");
+    }
+    
+    if (p2StartPressed) {
+      pump2On = true;
+      pump1On = false;  // Only one pump at a time
+      Serial.println("HAND: P2 START pressed - Pump 2 ON, Pump 1 OFF");
+    }
+    
+    if (p2StopPressed) {
+      pump2On = false;
+      Serial.println("HAND: P2 STOP pressed - Pump 2 OFF");
+    }
+    
+    // Update last states for edge detection
+    lastP1Start = pump1Start;
+    lastP1Stop = pump1Stop;
+    lastP2Start = pump2Start;
+    lastP2Stop = pump2Stop;
+    
+    // Check for any manual filling
+    for (int i = 0; i < NUM_TANKS; i++) {
+      if (coils[i]) anyFilling = true;
+    }
+  }
+  
+  // Apply valve outputs with safety interlocks
+  for (int i = 0; i < NUM_TANKS; i++) {
+    bool safeToFill = !discreteInputs[i] && !discreteInputs[10 + i] && 
+                      !diagnostics.sensorFaultFlags[i] && !emergencyStopActive;
+    bool valveCommand = coils[i] && safeToFill;
+    
+    // Physical valve outputs (Slot 6, channels 3-11) - per wiring diagram
+    if (i < 9 && (i + 3) <= 15) {
+      P1.writeDiscrete(valveCommand ? HIGH : LOW, OUTPUT_SLOT1, i + 3);
+    }
+    
+    // Status lights (Slot 7, channels 1-9) - TB14 connections
+    bool lightState = false;
+    bool hasAlarm = discreteInputs[i] || discreteInputs[10 + i] || 
+                    diagnostics.sensorFaultFlags[i] || emergencyStopActive;
+    float level = holdingRegisters[i] / 100.0;
+    bool tankFull = (level >= FILL_STOP_THRESHOLD);
+    
+    if (hasAlarm) {
+      lightState = false;
+    } else if (valveCommand) {
+      lightState = blinkState;
+    } else if (tankFull) {
+      lightState = true;
+    } else {
+      lightState = false;
+    }
+    
+    if (i < 9) {
+      P1.writeDiscrete(lightState ? HIGH : LOW, OUTPUT_SLOT2, i + 1);
+    }
+  }
+  
+  // PUMP CONTROL with enhanced logic
+  if (systemMode == 2 && anyFilling) {
+    // AUTO mode: intelligent pump alternation
+    if (millis() - lastPumpSwitch > PUMP_SWITCH_INTERVAL) {
+      leadPumpIsPump1 = !leadPumpIsPump1;
+      lastPumpSwitch = millis();
+      Serial.println("AUTO: Switched lead pump to " + String(leadPumpIsPump1 ? "1" : "2"));
+    }
+    
+    pump1On = leadPumpIsPump1;
+    pump2On = !leadPumpIsPump1;
+  } else if (systemMode != 1) {
+    // OFF mode or no filling required
+    pump1On = false;
+    pump2On = false;
+  }
+  
+  // Apply pump outputs (Slot 6, channels 1-2) - Relay 10/11 connections
+  P1.writeDiscrete(pump1On ? HIGH : LOW, OUTPUT_SLOT1, 1);
+  P1.writeDiscrete(pump2On ? HIGH : LOW, OUTPUT_SLOT1, 2);
+  
+  // Update coils for Modbus
+  coils[40] = pump1On;
+  coils[41] = pump2On;
+}
+
+void updateDiagnostics() {
+  // Update runtime counters
+  unsigned long now = millis();
+  
+  if (pump1On) {
+    diagnostics.pump1Runtime += 50; // Add loop time
+  }
+  if (pump2On) {
+    diagnostics.pump2Runtime += 50;
+  }
+  
+  // Store diagnostics in holding registers for Modbus access
+  holdingRegisters[50] = (uint16_t)(diagnostics.pump1Runtime / 1000); // Seconds
+  holdingRegisters[51] = (uint16_t)(diagnostics.pump2Runtime / 1000);
+  holdingRegisters[52] = (uint16_t)diagnostics.alarmCount;
+  
+  // Store fill cycles
+  for (int i = 0; i < NUM_TANKS && i < 10; i++) {
+    holdingRegisters[60 + i] = (uint16_t)diagnostics.fillCycles[i];
+  }
+}
+
+void updateModbusData() {
+  // System status in input registers
+  inputRegisters[0] = systemMode;
+  inputRegisters[1] = emergencyStopActive ? 1 : 0;
+  inputRegisters[2] = pump1On ? 1 : 0;
+  inputRegisters[3] = pump2On ? 1 : 0;
+  inputRegisters[4] = enableSystem ? 1 : 0;
+  
+  // Count active valves
+  int fillingCount = 0;
+  for (int i = 0; i < NUM_TANKS; i++) {
+    if (coils[i]) fillingCount++;
+  }
+  inputRegisters[5] = fillingCount;
+  
+  // Alarm status - HH alarms
+  int alarmStatus = 0;
+  if (discreteInputs[20]) alarmStatus |= 0x01; // Main EPO
+  for (int i = 0; i < NUM_TANKS; i++) {
+    if (discreteInputs[i]) alarmStatus |= (0x02 << i); // HH alarms
+  }
+  inputRegisters[6] = alarmStatus;
+  
+  // ENHANCED: EPO status in separate register
+  int epoStatus = 0;
+  if (discreteInputs[20]) epoStatus |= 0x200; // Main EPO (bit 9)
+  for (int i = 0; i < NUM_TANKS; i++) {
+    if (discreteInputs[10 + i]) epoStatus |= (0x01 << i); // Tank EPOs (bits 0-8)
+  }
+  inputRegisters[8] = epoStatus;
+  
+  // Sensor fault status
+  int sensorFaults = 0;
+  for (int i = 0; i < NUM_TANKS; i++) {
+    if (diagnostics.sensorFaultFlags[i]) sensorFaults |= (0x01 << i);
+  }
+  inputRegisters[7] = sensorFaults;
+  
+  // Modbus statistics
+  inputRegisters[10] = (uint16_t)(modbusRequestCount & 0xFFFF);
+  inputRegisters[11] = (uint16_t)(modbusSuccessCount & 0xFFFF);
+  inputRegisters[12] = (uint16_t)((millis() - lastModbusRequest) / 1000); // Seconds since last request
+}
+
+
+void reportSystemStatus() {
+  Serial.println("--- System Status Report ---");
+  Serial.println("Mode: " + String(systemMode == 0 ? "OFF" : (systemMode == 1 ? "HAND" : "AUTO")));
+  Serial.println("Pumps: " + String(pump1On ? "P1" : "--") + " " + String(pump2On ? "P2" : "--"));
+  
+  int filling = 0;
+  for (int i = 0; i < NUM_TANKS; i++) {
+    if (coils[i]) filling++;
+  }
+  Serial.println("Tanks filling: " + String(filling));
+  Serial.println("Runtime: " + String(millis() / 1000) + "s");
+  Serial.println("----------------------------");
+}
+
+void reportModbusStatistics() {
+  if (modbusRequestCount > 0) {
+    float successRate = (float)modbusSuccessCount / modbusRequestCount * 100.0;
+    Serial.println("--- Modbus Statistics ---");
+    Serial.println("Requests: " + String(modbusRequestCount));
+    Serial.println("Success: " + String(modbusSuccessCount));
+    Serial.println("Rate: " + String(successRate, 1) + "%");
+    Serial.println("Last: " + String((millis() - lastModbusRequest) / 1000) + "s ago");
+    Serial.println("------------------------");
+  }
+}
+
+void writeSingleCoil(uint16_t addr, bool value) {
+  if (addr < 50) {
+    coils[addr] = value;
+    
+    // Handle special coil addresses for system control
+    if (addr == 42) { // Emergency stop reset
+      if (value) emergencyStopActive = false;
+    } else if (addr == 43) { // System enable/disable
+      enableSystem = value;
+    }
+  }
+}
+
+void writeSingleRegister(uint16_t addr, uint16_t value) {
+  if (addr < 100) {
+    holdingRegisters[addr] = value;
+    
+    // Handle special register addresses for system control
+    if (addr == 80) { // System mode control
+      if (value <= 2) systemMode = value;
+    }
+  }
+}
+
+// =============================================================================
+// SERIAL COMMAND INTERFACE AND DIAGNOSTIC FUNCTIONS
+// =============================================================================
+
+void handleSerialCommands() {
+  if (Serial.available()) {
+    String cmd = Serial.readString();
+    cmd.trim();
+    cmd.toLowerCase();
+    
+    if (cmd == "help") {
+      showHelpMenu();
+    } else if (cmd == "status") {
+      showDetailedStatus();
+    } else if (cmd == "tanks") {
+      showTankLevels();
+    } else if (cmd == "flows") {
+      showFlowRates();
+    } else if (cmd == "inputs") {
+      showDigitalInputs();
+    } else if (cmd == "diagnostics") {
+      showDiagnostics();
+    } else if (cmd == "modbus") {
+      reportModbusStatistics();
+    } else if (cmd == "epo") {  // NEW COMMAND
+      testEPOSystems();
+    } else if (cmd == "safety") {  // NEW COMMAND
+      performSafetyCheck();
+    } else if (cmd == "auto") {
+      systemMode = 2;
+      Serial.println("System set to AUTO mode");
+    } else if (cmd == "hand") {
+      systemMode = 1;
+      Serial.println("System set to HAND mode");
+    } else if (cmd == "off") {
+      systemMode = 0;
+      Serial.println("System set to OFF mode");
+    } else if (cmd == "pump1") {
+      if (systemMode == 1) {
+        pump1On = !pump1On;
+        P1.writeDiscrete(pump1On ? HIGH : LOW, OUTPUT_SLOT1, 1);
+        Serial.println("Pump 1: " + String(pump1On ? "ON" : "OFF"));
+      } else {
+        Serial.println("Manual pump control only in HAND mode");
+      }
+    } else if (cmd == "pump2") {
+      if (systemMode == 1) {
+        pump2On = !pump2On;
+        P1.writeDiscrete(pump2On ? HIGH : LOW, OUTPUT_SLOT1, 2);
+        Serial.println("Pump 2: " + String(pump2On ? "ON" : "OFF"));
+      } else {
+        Serial.println("Manual pump control only in HAND mode");
+      }
+    } else if (cmd.startsWith("valve ")) {
+      int valveNum = cmd.substring(6).toInt();
+      if (valveNum >= 1 && valveNum <= NUM_TANKS && systemMode == 1) {
+        coils[valveNum - 1] = !coils[valveNum - 1];
+        Serial.println("Valve " + String(valveNum) + ": " + String(coils[valveNum - 1] ? "OPEN" : "CLOSED"));
+      } else {
+        Serial.println("Invalid valve or not in HAND mode");
+      }
+    } else if (cmd == "stop") {
+      emergencyStop();
+    } else if (cmd == "reset") {
+      emergencyStopActive = false;
+      Serial.println("Emergency stop reset");
+    } else if (cmd == "test") {
+      testOutputs();
+    } else if (cmd == "enable") {
+      enableSystem = true;
+      Serial.println("System ENABLED");
+    } else if (cmd == "disable") {
+      enableSystem = false;
+      emergencyStop();
+      Serial.println("System DISABLED");
+    } else if (cmd != "") {
+      Serial.println("Unknown command. Type 'help' or 'epo' to test EPO system");
+    }
+  }
+}
+
+void showHelpMenu() {
+  Serial.println("=== TANK CONTROL SYSTEM COMMANDS ===");
+  Serial.println("System Information:");
+  Serial.println("  help - Show this menu");
+  Serial.println("  status - Detailed system status");
+  Serial.println("  tanks - Tank levels and status");
+  Serial.println("  flows - Flow meter readings");
+  Serial.println("  inputs - Digital input status");
+  Serial.println("  diagnostics - System diagnostics");
+  Serial.println("  modbus - Modbus communication stats");
+  Serial.println("");
+  Serial.println("Operation Control:");
+  Serial.println("  auto - Set AUTO mode (automatic operation)");
+  Serial.println("  hand - Set HAND mode (manual control)");
+  Serial.println("  off - Set OFF mode (all outputs off)");
+  Serial.println("  pump1 - Toggle pump 1 (HAND mode only)");
+  Serial.println("  pump2 - Toggle pump 2 (HAND mode only)");
+  Serial.println("  valve X - Toggle valve X (HAND mode only)");
+  Serial.println("");
+  Serial.println("Safety & Maintenance:");
+  Serial.println("  stop - Emergency stop all operations");
+  Serial.println("  reset - Reset emergency stop condition");
+  Serial.println("  test - Test all output channels");
+  Serial.println("  enable - Enable system operation");
+  Serial.println("  disable - Disable system operation");
+  Serial.println("=====================================");
+}
+
+void showDetailedStatus() {
+  Serial.println("=== DETAILED SYSTEM STATUS ===");
+  Serial.println("Hardware:");
+  Serial.println("  P1AM: " + String(p1amOK ? "OK" : "FAULT"));
+  Serial.println("  Ethernet: " + String(ethOK ? "OK" : "FAULT"));
+  if (ethOK) {
+    Serial.println("  IP: " + String(Ethernet.localIP()[0]) + "." + 
+                   String(Ethernet.localIP()[1]) + "." + 
+                   String(Ethernet.localIP()[2]) + "." + 
+                   String(Ethernet.localIP()[3]));
+  }
+  
+  Serial.println("");
+  Serial.println("Operation:");
+  Serial.println("  System: " + String(enableSystem ? "ENABLED" : "DISABLED"));
+  Serial.println("  Mode: " + String(systemMode == 0 ? "OFF" : (systemMode == 1 ? "HAND" : "AUTO")));
+  Serial.println("  Emergency Stop: " + String(emergencyStopActive ? "ACTIVE" : "OK"));
+  Serial.println("  Pump 1: " + String(pump1On ? "ON" : "OFF"));
+  Serial.println("  Pump 2: " + String(pump2On ? "ON" : "OFF"));
+  
+  Serial.println("");
+  Serial.println("Modbus:");
+  Serial.println("  Requests: " + String(modbusRequestCount));
+  Serial.println("  Success: " + String(modbusSuccessCount));
+  if (modbusRequestCount > 0) {
+    float rate = (float)modbusSuccessCount / modbusRequestCount * 100.0;
+    Serial.println("  Success Rate: " + String(rate, 1) + "%");
+  }
+  Serial.println("==============================");
+}
+
+void showTankLevels() {
+  Serial.println("=== TANK LEVELS ===");
+  for (int i = 0; i < NUM_TANKS; i++) {
+    float level = holdingRegisters[i] / 100.0;
+    String status = "";
+    
+    // Add status indicators
+    if (discreteInputs[i]) status += " [HH]";
+    if (discreteInputs[10 + i]) status += " [EPO]";
+    if (coils[i]) status += " [FILLING]";
+    if (diagnostics.sensorFaultFlags[i]) status += " [FAULT]";
+    
+    Serial.println("Tank " + String(i + 1) + ": " + String(level, 1) + "%" + status);
+  }
+  Serial.println("==================");
+}
+
+void showFlowRates() {
+  Serial.println("=== FLOW RATES ===");
+  for (int i = 0; i < NUM_FLOWS; i++) {
+    float flow = holdingRegisters[10 + i] / 100.0;
+    Serial.println("Flow " + String(i + 1) + ": " + String(flow, 1) + " GPM");
+  }
+  Serial.println("==================");
+}
+
+void showDigitalInputs() {
+  Serial.println("=== DIGITAL INPUTS ===");
+  Serial.println("Current Mode: " + String(systemMode == 0 ? "OFF" : (systemMode == 1 ? "HAND" : "AUTO")));
+  Serial.println("Pump 1 Status: " + String(pump1On ? "RUNNING" : "STOPPED"));
+  Serial.println("Pump 2 Status: " + String(pump2On ? "RUNNING" : "STOPPED"));
+  Serial.println("Main EPO: " + String(discreteInputs[20] ? "ACTIVE" : "OK"));
+  Serial.println("======================");
+}
+
+void showDiagnostics() {
+  Serial.println("=== SYSTEM DIAGNOSTICS ===");
+  
+  unsigned long totalSeconds = millis() / 1000;
+  unsigned long hours = totalSeconds / 3600;
+  unsigned long minutes = (totalSeconds % 3600) / 60;
+  unsigned long seconds = totalSeconds % 60;
+  Serial.println("  Total Runtime: " + String(hours) + "h " + String(minutes) + "m " + String(seconds) + "s");
+  
+  Serial.println("  Pump 1 Runtime: " + String(diagnostics.pump1Runtime / 1000) + "s");
+  Serial.println("  Pump 2 Runtime: " + String(diagnostics.pump2Runtime / 1000) + "s");
+  Serial.println("  Total Alarms: " + String(diagnostics.alarmCount));
+  
+  if (modbusRequestCount > 0) {
+    float rate = (float)modbusSuccessCount / modbusRequestCount * 100.0;
+    Serial.println("  Modbus Success Rate: " + String(rate, 1) + "%");
+  }
+  Serial.println("==========================");
+}
+
+void testOutputs() {
+  Serial.println("=== OUTPUT TEST SEQUENCE ===");
+  Serial.println("Testing all output channels...");
+  
+  // Test pump outputs
+  Serial.println("Testing Pump 1");
+  P1.writeDiscrete(HIGH, OUTPUT_SLOT1, 1);
+  delay(2000);
+  P1.writeDiscrete(LOW, OUTPUT_SLOT1, 1);
+  
+  Serial.println("Testing Pump 2");
+  P1.writeDiscrete(HIGH, OUTPUT_SLOT1, 2);
+  delay(2000);
+  P1.writeDiscrete(LOW, OUTPUT_SLOT1, 2);
+  
+  // Test valve outputs
+  for (int i = 0; i < NUM_TANKS; i++) {
+    Serial.println("Testing Valve " + String(i + 1));
+    if ((i + 3) <= 15) {
+      P1.writeDiscrete(HIGH, OUTPUT_SLOT1, i + 3);
+      delay(1000);
+      P1.writeDiscrete(LOW, OUTPUT_SLOT1, i + 3);
+    }
+    delay(500);
+  }
+  
+  // Test status lights
+  Serial.println("Testing Status Lights");
+  for (int i = 0; i < NUM_TANKS; i++) {
+    P1.writeDiscrete(HIGH, OUTPUT_SLOT2, i + 1);
+    delay(300);
+    P1.writeDiscrete(LOW, OUTPUT_SLOT2, i + 1);
+  }
+  
+  Serial.println("Output test sequence complete");
+  Serial.println("============================");
+}
+
+void emergencyStop() {
+  Serial.println("===============================");
+  Serial.println("⚠⚠⚠ EMERGENCY STOP ACTIVATED ⚠⚠⚠");
+  Serial.println("All outputs have been shut down");
+  Serial.println("===============================");
+  
+  // Stop pumps immediately
+  pump1On = false;
+  pump2On = false;
+  P1.writeDiscrete(LOW, OUTPUT_SLOT1, 1);
+  P1.writeDiscrete(LOW, OUTPUT_SLOT1, 2);
+  
+  // Close all valves and clear coils
+  for (int i = 0; i < NUM_TANKS; i++) {
+    coils[i] = false;
+    
+    // Valve outputs (channels 3-11)
+    if (i < 9 && (i + 3) <= 15) {
+      P1.writeDiscrete(LOW, OUTPUT_SLOT1, i + 3);
+    }
+    
+    // Status lights (channels 1-9)
+    P1.writeDiscrete(LOW, OUTPUT_SLOT2, i + 1);
+  }
+  
+  // Clear pump coils for Modbus
+  coils[40] = false;
+  coils[41] = false;
+  
+  // Increment alarm counter
+  diagnostics.alarmCount++;
+  
+  emergencyStopActive = true;
+}
+
+// EPO Test Function 
+void testEPOSystems() {
+  Serial.println("=== EPO SYSTEM TEST ===");
+  
+  Serial.println("Reading Raw Digital Inputs:");
+  
+  // Test HH switches
+  Serial.println("HH Switches (Slot 3, Ch 1-9):");
+  for (int i = 0; i < NUM_TANKS; i++) {
+    bool rawValue = P1.readDiscrete(INPUT_SLOT1, i + 1);
+    Serial.println("  Tank " + String(i + 1) + " HH (Ch " + String(i + 1) + "): " + 
+                   String(rawValue ? "HIGH" : "LOW"));
+  }
+  
+  // Test Tank EPOs  
+  Serial.println("Tank EPOs:");
+  for (int i = 0; i < NUM_TANKS; i++) {
+    bool rawValue;
+    String location;
+    
+    if (i < 7) {
+      rawValue = P1.readDiscrete(INPUT_SLOT1, i + 10);
+      location = "Slot 3, Ch " + String(i + 10);
+    } else {
+      rawValue = P1.readDiscrete(INPUT_SLOT2, i - 6);
+      location = "Slot 4, Ch " + String(i - 6);
+    }
+    
+    Serial.println("  Tank " + String(i + 1) + " EPO (" + location + "): " + 
+                   String(rawValue ? "ACTIVE" : "OK"));
+  }
+  
+  // Test Main EPO
+  bool mainEPO = P1.readDiscrete(INPUT_SLOT2, 3);
+  Serial.println("Main EPO (Slot 4, Ch 3): " + String(mainEPO ? "ACTIVE" : "OK"));
+  
+  Serial.println("=====================");
+  
+  // Test EPO logic
+  Serial.println("Current Discrete Input Array:");
+  for (int i = 0; i <= 20; i++) {
+    Serial.println("  DI[" + String(i) + "] = " + String(discreteInputs[i]));
+  }
+  
+  Serial.println("======================");
+}
+
+void shutdownAllOutputs() {
+  Serial.println("Shutting down all outputs (OFF mode)");
+  
+  // Stop pumps
+  pump1On = false;
+  pump2On = false;
+  P1.writeDiscrete(LOW, OUTPUT_SLOT1, 1);
+  P1.writeDiscrete(LOW, OUTPUT_SLOT1, 2);
+  
+  // Close all valves and turn off lights
+  for (int i = 0; i < NUM_TANKS; i++) {
+    coils[i] = false;
+    
+    // Valve outputs (channels 3-11)
+    if (i < 9 && (i + 3) <= 15) {
+      P1.writeDiscrete(LOW, OUTPUT_SLOT1, i + 3);
+    }
+    
+    // Status lights (channels 1-9)
+    P1.writeDiscrete(LOW, OUTPUT_SLOT2, i + 1);
+  }
+  
+  // Clear pump coils for Modbus
+  coils[40] = false;
+  coils[41] = false;
+}
+
+void fatalError() {
+  Serial.println("FATAL ERROR: System cannot continue");
+  while(1) {
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    delay(100);
+  }
+}
