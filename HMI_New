@@ -1,0 +1,1080 @@
+#!/usr/bin/env python3
+"""
+Tank Control HMI - FIXED VERSION - Pump Status and Timeout Issues
+=================================================================
+
+FIXES:
+1. Pump status reading corrected
+2. More efficient data reading cycle
+3. Better timeout handling
+4. Improved real-time updates
+
+Version: 5.1 - Bug Fixes
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import time
+import sys
+from datetime import datetime
+
+# Import pymodbus with version detection
+try:
+    import pymodbus
+    version = getattr(pymodbus, '__version__', 'unknown')
+    print(f"✓ PyModbus version: {version}")
+except ImportError:
+    print("✗ PyModbus not installed")
+    sys.exit(1)
+
+# Import client
+try:
+    from pymodbus.client import ModbusTcpClient
+    print("✓ Using modern pymodbus")
+except ImportError:
+    try:
+        from pymodbus.client.sync import ModbusTcpClient
+        print("✓ Using legacy pymodbus")
+    except ImportError:
+        print("✗ Cannot import ModbusTcpClient")
+        sys.exit(1)
+
+class ArduinoModbusClient:
+    """
+    Arduino-compatible Modbus client - IMPROVED VERSION
+    """
+    
+    def __init__(self, host, port=502):
+        self.host = host
+        self.port = port
+        self.last_error = ""
+    
+    def _safe_request(self, request_func, description="request"):
+        """Make a safe Modbus request - IMPROVED with better timeout handling"""
+        max_retries = 2
+        
+        for attempt in range(max_retries):
+            client = None
+            try:
+                # Create fresh client for each request
+                client = ModbusTcpClient(self.host, port=self.port)
+                
+                # Shorter connect timeout to prevent hangs
+                client.timeout = 2  # 2 second timeout
+                
+                # Connect
+                if not client.connect():
+                    self.last_error = f"Connection failed on attempt {attempt + 1}"
+                    if attempt < max_retries - 1:
+                        time.sleep(0.1)  # Shorter delay between retries
+                    continue
+                
+                # Make the request
+                result = request_func(client)
+                
+                # Close immediately for Arduino compatibility
+                client.close()
+                
+                if result and not result.isError():
+                    self.last_error = ""
+                    return result
+                else:
+                    self.last_error = f"{description} failed: {result}"
+                    
+            except Exception as e:
+                self.last_error = f"{description} exception: {e}"
+                
+            finally:
+                if client:
+                    try:
+                        client.close()
+                    except:
+                        pass
+            
+            if attempt < max_retries - 1:
+                time.sleep(0.1)  # Shorter retry delay
+        
+        return None
+    
+    def read_holding_registers(self, address, count):
+        """Read holding registers with PyModbus 4.x syntax"""
+        def request(client):
+            return client.read_holding_registers(address=address, count=count, slave=1)
+        
+        result = self._safe_request(request, f"read_holding_registers({address}, {count})")
+        return result.registers if result else None
+    
+    def read_input_registers(self, address, count):
+        """Read input registers with PyModbus 4.x syntax"""
+        def request(client):
+            return client.read_input_registers(address=address, count=count, slave=1)
+        
+        result = self._safe_request(request, f"read_input_registers({address}, {count})")
+        return result.registers if result else None
+    
+    def read_coils(self, address, count):
+        """Read coils with PyModbus 4.x syntax"""
+        def request(client):
+            return client.read_coils(address=address, count=count, slave=1)
+        
+        result = self._safe_request(request, f"read_coils({address}, {count})")
+        return result.bits if result else None
+    
+    def read_discrete_inputs(self, address, count):
+        """Read discrete inputs with PyModbus 4.x syntax"""
+        def request(client):
+            return client.read_discrete_inputs(address=address, count=count, slave=1)
+        
+        result = self._safe_request(request, f"read_discrete_inputs({address}, {count})")
+        return result.bits if result else None
+    
+    def write_coil(self, address, value):
+        """Write single coil with PyModbus 4.x syntax"""
+        def request(client):
+            return client.write_coil(address=address, value=value, slave=1)
+        
+        result = self._safe_request(request, f"write_coil({address}, {value})")
+        return result is not None
+    
+    def write_register(self, address, value):
+        """Write single register with PyModbus 4.x syntax"""
+        def request(client):
+            return client.write_register(address=address, value=value, slave=1)
+        
+        result = self._safe_request(request, f"write_register({address}, {value})")
+        return result is not None
+
+class TankControlHMI:
+    def __init__(self):
+        # Configuration
+        self.PLC_IP = "192.168.1.100"
+        self.PLC_PORT = 502
+        self.UPDATE_RATE = 500  # Faster updates - 500ms
+        self.DEBUG_MODE = False
+        
+        # Modbus client
+        self.modbus = ArduinoModbusClient(self.PLC_IP, self.PLC_PORT)
+        self.connected = False
+        
+        # Data storage
+        self.tank_levels = [0.0] * 9
+        self.flow_rates = [0.0] * 2
+        self.system_mode = 0  # 0=OFF, 1=HAND, 2=AUTO
+        self.pump_status = [False, False]  # FIXED: Initialize properly
+        self.valve_status = [False] * 9
+        self.hh_alarms = [False] * 9
+        self.epo_alarms = [False] * 9
+        self.main_epo = False
+        self.emergency_stop = False
+        
+        # Statistics
+        self.read_count = 0
+        self.success_count = 0
+        self.last_error = ""
+        
+        # IMPROVED: More efficient read cycle management
+        self.read_cycle = 0
+        self.tank_read_batch = 0  # Read tanks in batches
+        
+        # GUI
+        self.root = tk.Tk()
+        self.setup_gui()
+        
+        # Start threads
+        self.running = True
+        self.start_threads()
+        
+        self.log_message("Tank Control HMI v5.1 - Bug Fixes")
+        self.log_message(f"Using PyModbus {getattr(pymodbus, '__version__', 'unknown')}")
+        self.log_message("✓ Pump status reading fixed")
+        self.log_message("✓ Timeout handling improved")
+    
+    def setup_gui(self):
+        """Setup the GUI - Updated title"""
+        self.root.title("Tank Control HMI v5.1 - Bug Fixes")
+        self.root.geometry("1400x900")
+        self.root.configure(bg='#2d2d2d')
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Main frame
+        main_frame = tk.Frame(self.root, bg='#2d2d2d')
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Title
+        title_frame = tk.Frame(main_frame, bg='#2d2d2d')
+        title_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        tk.Label(title_frame, text="TANK CONTROL SYSTEM v5.1", 
+                font=('Arial', 20, 'bold'), fg='white', bg='#2d2d2d').pack(side=tk.LEFT)
+        
+        self.status_label = tk.Label(title_frame, text="DISCONNECTED", 
+                                    font=('Arial', 14, 'bold'), fg='red', bg='#2d2d2d')
+        self.status_label.pack(side=tk.RIGHT)
+        
+        # Create notebook
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # Create tabs
+        self.create_overview_tab()
+        self.create_control_tab()
+        self.create_diagnostics_tab()
+    
+    def create_overview_tab(self):
+        """Create main overview tab"""
+        overview_frame = tk.Frame(self.notebook, bg='#2d2d2d')
+        self.notebook.add(overview_frame, text="OVERVIEW")
+        
+        # Left side - Tanks
+        left_frame = tk.LabelFrame(overview_frame, text="TANK LEVELS", 
+                                  font=('Arial', 12, 'bold'), fg='white', bg='#2d2d2d')
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
+        # Tank grid
+        tank_container = tk.Frame(left_frame, bg='#2d2d2d')
+        tank_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        self.tank_widgets = []
+        for i in range(9):
+            row = i // 3
+            col = i % 3
+            
+            tank_frame = tk.Frame(tank_container, bg='#1a1a1a', relief='raised', bd=2)
+            tank_frame.grid(row=row, column=col, padx=5, pady=5, sticky='nsew')
+            
+            # Tank canvas
+            canvas = tk.Canvas(tank_frame, width=120, height=150, bg='#1a1a1a', 
+                              highlightthickness=0)
+            canvas.pack(pady=5)
+            
+            # Labels
+            tk.Label(tank_frame, text=f"TANK {i+1}", font=('Arial', 10, 'bold'),
+                    fg='white', bg='#1a1a1a').pack()
+            
+            level_label = tk.Label(tank_frame, text="0.0%", font=('Arial', 10),
+                                  fg='cyan', bg='#1a1a1a')
+            level_label.pack()
+            
+            status_label = tk.Label(tank_frame, text="IDLE", font=('Arial', 9),
+                                   fg='gray', bg='#1a1a1a')
+            status_label.pack(pady=(0, 5))
+            
+            self.tank_widgets.append({
+                'canvas': canvas,
+                'level_label': level_label,
+                'status_label': status_label
+            })
+        
+        # Configure grid
+        for i in range(3):
+            tank_container.grid_columnconfigure(i, weight=1)
+            tank_container.grid_rowconfigure(i, weight=1)
+        
+        # Right side - System info
+        right_frame = tk.LabelFrame(overview_frame, text="SYSTEM STATUS", 
+                                   font=('Arial', 12, 'bold'), fg='white', bg='#2d2d2d')
+        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+        
+        self.create_system_status_widgets(right_frame)
+    
+    def create_system_status_widgets(self, parent):
+        """Create system status widgets"""
+        info_container = tk.Frame(parent, bg='#2d2d2d')
+        info_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # System mode
+        mode_frame = tk.LabelFrame(info_container, text="MODE", 
+                                  font=('Arial', 11, 'bold'), fg='white', bg='#2d2d2d')
+        mode_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.mode_label = tk.Label(mode_frame, text="OFF", font=('Arial', 24, 'bold'),
+                                  fg='red', bg='#2d2d2d')
+        self.mode_label.pack(pady=10)
+        
+        # Pumps - IMPROVED display
+        pump_frame = tk.LabelFrame(info_container, text="PUMPS", 
+                                  font=('Arial', 11, 'bold'), fg='white', bg='#2d2d2d')
+        pump_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.pump_labels = []
+        for i in range(2):
+            pump_row = tk.Frame(pump_frame, bg='#2d2d2d')
+            pump_row.pack(fill=tk.X, padx=10, pady=5)
+            
+            tk.Label(pump_row, text=f"Pump {i+1}:", font=('Arial', 10),
+                    fg='white', bg='#2d2d2d').pack(side=tk.LEFT)
+            
+            pump_label = tk.Label(pump_row, text="OFF", font=('Arial', 10, 'bold'),
+                                 fg='gray', bg='#2d2d2d')
+            pump_label.pack(side=tk.RIGHT)
+            self.pump_labels.append(pump_label)
+        
+        # Flows
+        flow_frame = tk.LabelFrame(info_container, text="FLOWS", 
+                                  font=('Arial', 11, 'bold'), fg='white', bg='#2d2d2d')
+        flow_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.flow_labels = []
+        for i in range(2):
+            flow_row = tk.Frame(flow_frame, bg='#2d2d2d')
+            flow_row.pack(fill=tk.X, padx=10, pady=5)
+            
+            tk.Label(flow_row, text=f"Flow {i+1}:", font=('Arial', 10),
+                    fg='white', bg='#2d2d2d').pack(side=tk.LEFT)
+            
+            flow_label = tk.Label(flow_row, text="0.0 GPM", font=('Arial', 10, 'bold'),
+                                 fg='cyan', bg='#2d2d2d')
+            flow_label.pack(side=tk.RIGHT)
+            self.flow_labels.append(flow_label)
+        
+        # Alarms
+        alarm_frame = tk.LabelFrame(info_container, text="ALARMS", 
+                                   font=('Arial', 11, 'bold'), fg='white', bg='#2d2d2d')
+        alarm_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.alarm_listbox = tk.Listbox(alarm_frame, bg='#1a1a1a', fg='red',
+                                       font=('Courier', 9), height=8)
+        alarm_scroll = tk.Scrollbar(alarm_frame, orient=tk.VERTICAL,
+                                   command=self.alarm_listbox.yview)
+        self.alarm_listbox.configure(yscrollcommand=alarm_scroll.set)
+        
+        self.alarm_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        alarm_scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=10)
+    
+    def create_control_tab(self):
+        """Create control tab"""
+        control_frame = tk.Frame(self.notebook, bg='#2d2d2d')
+        self.notebook.add(control_frame, text="CONTROL")
+        
+        # Connection controls
+        conn_frame = tk.LabelFrame(control_frame, text="CONNECTION", 
+                                  font=('Arial', 12, 'bold'), fg='white', bg='#2d2d2d')
+        conn_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        conn_row1 = tk.Frame(conn_frame, bg='#2d2d2d')
+        conn_row1.pack(fill=tk.X, padx=10, pady=10)
+        
+        tk.Label(conn_row1, text="PLC IP:", font=('Arial', 11),
+                fg='white', bg='#2d2d2d').pack(side=tk.LEFT)
+        
+        self.ip_entry = tk.Entry(conn_row1, font=('Arial', 11), width=15)
+        self.ip_entry.pack(side=tk.LEFT, padx=10)
+        self.ip_entry.insert(0, self.PLC_IP)
+        
+        tk.Button(conn_row1, text="UPDATE IP", font=('Arial', 10, 'bold'),
+                 bg='blue', fg='white', command=self.update_ip).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(conn_row1, text="TEST CONNECTION", font=('Arial', 10, 'bold'),
+                 bg='green', fg='white', command=self.test_connection).pack(side=tk.LEFT, padx=5)
+        
+        # Communication settings
+        settings_frame = tk.LabelFrame(control_frame, text="COMMUNICATION SETTINGS", 
+                                     font=('Arial', 12, 'bold'), fg='white', bg='#2d2d2d')
+        settings_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        settings_row = tk.Frame(settings_frame, bg='#2d2d2d')
+        settings_row.pack(fill=tk.X, padx=10, pady=10)
+        
+        tk.Label(settings_row, text="Update Rate (ms):", font=('Arial', 10),
+                fg='white', bg='#2d2d2d').pack(side=tk.LEFT)
+        
+        self.rate_var = tk.StringVar(value=str(self.UPDATE_RATE))
+        rate_entry = tk.Entry(settings_row, textvariable=self.rate_var, width=10)
+        rate_entry.pack(side=tk.LEFT, padx=10)
+        
+        tk.Button(settings_row, text="APPLY", command=self.update_rate).pack(side=tk.LEFT, padx=5)
+        
+        debug_var = tk.BooleanVar(value=self.DEBUG_MODE)
+        tk.Checkbutton(settings_row, text="Debug Mode", variable=debug_var, 
+                      fg='white', bg='#2d2d2d', command=lambda: setattr(self, 'DEBUG_MODE', debug_var.get())).pack(side=tk.LEFT, padx=20)
+        
+        # Manual controls
+        manual_frame = tk.LabelFrame(control_frame, text="MANUAL CONTROL (HAND MODE ONLY)", 
+                                    font=('Arial', 12, 'bold'), fg='white', bg='#2d2d2d')
+        manual_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Valve controls in a grid
+        valve_control_frame = tk.LabelFrame(manual_frame, text="VALVE CONTROL", 
+                                           font=('Arial', 11, 'bold'), fg='white', bg='#2d2d2d')
+        valve_control_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        valve_grid = tk.Frame(valve_control_frame, bg='#2d2d2d')
+        valve_grid.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        self.valve_buttons = []
+        for i in range(9):
+            row = i // 3
+            col = i % 3
+            
+            btn = tk.Button(valve_grid, text=f"VALVE {i+1}\nCLOSED", 
+                           font=('Arial', 9), width=12, height=3,
+                           command=lambda idx=i: self.toggle_valve(idx))
+            btn.grid(row=row, column=col, padx=5, pady=5, sticky='nsew')
+            self.valve_buttons.append(btn)
+        
+        for i in range(3):
+            valve_grid.grid_columnconfigure(i, weight=1)
+        
+        # Emergency stop
+        emergency_frame = tk.Frame(manual_frame, bg='#2d2d2d')
+        emergency_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        tk.Button(emergency_frame, text="EMERGENCY STOP", 
+                 font=('Arial', 16, 'bold'), bg='red', fg='white', height=2,
+                 command=self.emergency_stop_command).pack(fill=tk.X)
+    
+    def create_diagnostics_tab(self):
+        """Create diagnostics tab"""
+        diag_frame = tk.Frame(self.notebook, bg='#2d2d2d')
+        self.notebook.add(diag_frame, text="DIAGNOSTICS")
+        
+        # Communication stats
+        stats_frame = tk.LabelFrame(diag_frame, text="COMMUNICATION STATISTICS", 
+                                   font=('Arial', 12, 'bold'), fg='white', bg='#2d2d2d')
+        stats_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        stats_container = tk.Frame(stats_frame, bg='#2d2d2d')
+        stats_container.pack(fill=tk.X, padx=10, pady=10)
+        
+        self.stats_labels = {}
+        stats_items = [
+            ("Total Reads:", "0"),
+            ("Successful:", "0"),
+            ("Success Rate:", "0%"),
+            ("Last Error:", "None")
+        ]
+        
+        for i, (label, value) in enumerate(stats_items):
+            row = tk.Frame(stats_container, bg='#2d2d2d')
+            row.pack(fill=tk.X, pady=2)
+            
+            tk.Label(row, text=label, font=('Arial', 10), 
+                    fg='white', bg='#2d2d2d').pack(side=tk.LEFT)
+            
+            value_label = tk.Label(row, text=value, font=('Arial', 10, 'bold'), 
+                                  fg='cyan', bg='#2d2d2d')
+            value_label.pack(side=tk.RIGHT)
+            self.stats_labels[label] = value_label
+        
+        # Test buttons
+        test_frame = tk.LabelFrame(diag_frame, text="MODBUS TESTS", 
+                                  font=('Arial', 12, 'bold'), fg='white', bg='#2d2d2d')
+        test_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        test_buttons = tk.Frame(test_frame, bg='#2d2d2d')
+        test_buttons.pack(fill=tk.X, padx=10, pady=10)
+        
+        tk.Button(test_buttons, text="TEST SYSTEM STATUS", command=self.test_system_status).pack(side=tk.LEFT, padx=2)
+        tk.Button(test_buttons, text="TEST TANK BATCH", command=self.test_tank_batch).pack(side=tk.LEFT, padx=2)
+        tk.Button(test_buttons, text="TEST PUMPS", command=self.test_pump_status).pack(side=tk.LEFT, padx=2)
+        tk.Button(test_buttons, text="TEST VALVES", command=self.test_valves).pack(side=tk.LEFT, padx=2)
+        tk.Button(test_buttons, text="TEST EPO", command=self.test_epo_status).pack(side=tk.LEFT, padx=2)
+        tk.Button(test_buttons, text="TEST SAFETY", command=self.test_safety_systems).pack(side=tk.LEFT, padx=2)
+        
+        # Log
+        log_frame = tk.LabelFrame(diag_frame, text="COMMUNICATION LOG", 
+                                 font=('Arial', 12, 'bold'), fg='white', bg='#2d2d2d')
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        self.log_text = tk.Text(log_frame, bg='#1a1a1a', fg='white', 
+                               font=('Courier', 9), wrap=tk.WORD)
+        log_scroll = tk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=10)
+        
+        # Clear log button
+        tk.Button(log_frame, text="CLEAR LOG", command=self.clear_log).pack(side=tk.LEFT, pady=5)
+    
+    def start_threads(self):
+        """Start background threads"""
+        # Communication thread
+        comm_thread = threading.Thread(target=self.communication_loop, daemon=True)
+        comm_thread.start()
+        
+        # GUI update thread
+        gui_thread = threading.Thread(target=self.gui_update_loop, daemon=True)
+        gui_thread.start()
+    
+    def communication_loop(self):
+        """FIXED communication loop with better pump status reading"""
+        while self.running:
+            try:
+                self.read_plc_data_improved()
+            except Exception as e:
+                self.last_error = str(e)
+                if self.DEBUG_MODE:
+                    self.log_message(f"Communication loop error: {e}")
+            
+            time.sleep(self.UPDATE_RATE / 1000.0)
+    
+    def read_plc_data_improved(self):
+    """
+    IMPROVED data reading - FIXED EPO reading added
+    """
+    self.read_count += 1
+    
+    # Use a 5-cycle approach to include EPO reading
+    cycle_type = self.read_cycle % 5
+    
+    if cycle_type == 0:
+        # Cycle 0: Read system status including pump status (addresses 0-4)
+        result = self.modbus.read_input_registers(0, 5)
+        if result and len(result) >= 5:
+            self.system_mode = result[0]
+            self.emergency_stop = bool(result[1])
+            self.pump_status[0] = bool(result[2])  # Pump 1 status
+            self.pump_status[1] = bool(result[3])  # Pump 2 status
+            # result[4] is system enable status
+            
+            self.success_count += 1
+            if self.DEBUG_MODE:
+                mode_names = ["OFF", "HAND", "AUTO"]
+                mode_name = mode_names[self.system_mode] if self.system_mode < 3 else f"UNKNOWN({self.system_mode})"
+                pump_status = f"P1:{'ON' if self.pump_status[0] else 'OFF'}, P2:{'ON' if self.pump_status[1] else 'OFF'}"
+                self.log_message(f"System: {mode_name}, {pump_status}, E-Stop: {self.emergency_stop}")
+        
+    elif cycle_type == 1:
+        # Cycle 1: Read tank levels in batches (3 tanks at a time)
+        batch_size = 3
+        start_tank = self.tank_read_batch * batch_size
+        
+        if start_tank < 9:
+            end_tank = min(start_tank + batch_size, 9)
+            count = end_tank - start_tank
+            
+            result = self.modbus.read_holding_registers(start_tank, count)
+            if result and len(result) >= count:
+                for i in range(count):
+                    tank_idx = start_tank + i
+                    if tank_idx < 9:
+                        self.tank_levels[tank_idx] = result[i] / 100.0
+                
+                self.success_count += 1
+                if self.DEBUG_MODE:
+                    levels = [f"T{start_tank+i+1}:{self.tank_levels[start_tank+i]:.1f}%" 
+                            for i in range(count)]
+                    self.log_message(f"Tanks {start_tank+1}-{start_tank+count}: {levels}")
+            
+            self.tank_read_batch = (self.tank_read_batch + 1) % 3  # 3 batches total (0-2, 3-5, 6-8)
+        
+    elif cycle_type == 2:
+        # Cycle 2: Read flow rates
+        result = self.modbus.read_holding_registers(10, 2)
+        if result and len(result) >= 2:
+            self.flow_rates[0] = result[0] / 100.0
+            self.flow_rates[1] = result[1] / 100.0
+            self.success_count += 1
+            if self.DEBUG_MODE:
+                self.log_message(f"Flows: {self.flow_rates[0]:.1f} GPM, {self.flow_rates[1]:.1f} GPM")
+        
+    elif cycle_type == 3:
+        # Cycle 3: Read valve status (first 9 coils)
+        result = self.modbus.read_coils(0, 9)
+        if result and len(result) >= 9:
+            for i in range(9):
+                self.valve_status[i] = result[i]
+            self.success_count += 1
+            if self.DEBUG_MODE:
+                open_valves = [i+1 for i, v in enumerate(self.valve_status) if v]
+                self.log_message(f"Open valves: {open_valves}")
+    
+    elif cycle_type == 4:
+        # Cycle 4: CRITICAL - Read EPO and HH alarm status
+        # First read HH alarms (discrete inputs 0-8)
+        hh_result = self.modbus.read_discrete_inputs(0, 9)
+        if hh_result and len(hh_result) >= 9:
+            for i in range(9):
+                self.hh_alarms[i] = hh_result[i]
+            
+            # Then read EPO status from input register 8 (Arduino puts EPO status here)
+            epo_reg_result = self.modbus.read_input_registers(8, 1)
+            if epo_reg_result and len(epo_reg_result) >= 1:
+                epo_status = epo_reg_result[0]
+                
+                # Decode EPO status bits
+                for i in range(9):
+                    self.epo_alarms[i] = bool(epo_status & (1 << i))  # Tank EPOs (bits 0-8)
+                
+                self.main_epo = bool(epo_status & (1 << 9))  # Main EPO (bit 9)
+                
+                self.success_count += 1
+                
+                if self.DEBUG_MODE:
+                    active_hh = [i+1 for i, v in enumerate(self.hh_alarms) if v]
+                    active_epo = [i+1 for i, v in enumerate(self.epo_alarms) if v]
+                    self.log_message(f"HH Alarms: {active_hh}, EPO Alarms: {active_epo}, Main EPO: {self.main_epo}")
+            
+            else:
+                # Fallback: Try to read EPO discrete inputs directly (10-18 and 20)
+                try:
+                    # Read tank EPOs (discrete inputs 10-18)
+                    epo_result = self.modbus.read_discrete_inputs(10, 9)
+                    if epo_result:
+                        for i in range(min(9, len(epo_result))):
+                            self.epo_alarms[i] = epo_result[i]
+                    
+                    # Read main EPO (discrete input 20)
+                    main_epo_result = self.modbus.read_discrete_inputs(20, 1)
+                    if main_epo_result:
+                        self.main_epo = main_epo_result[0]
+                        
+                except Exception as e:
+                    if self.DEBUG_MODE:
+                        self.log_message(f"EPO fallback read failed: {e}")
+    
+    self.read_cycle += 1
+    
+    # Update connection status based on recent success
+    recent_reads = min(self.read_count, 20)  # Look at last 20 reads
+    if self.read_count >= 20:
+        recent_success = self.success_count - (self.read_count - 20)
+        success_rate = recent_success / 20.0
+    else:
+        success_rate = self.success_count / self.read_count if self.read_count > 0 else 0
+    
+    self.connected = success_rate > 0.5  # Consider connected if >50% success rate
+    
+    def gui_update_loop(self):
+        """GUI update loop"""
+        while self.running:
+            try:
+                self.update_gui()
+            except Exception as e:
+                if self.DEBUG_MODE:
+                    print(f"GUI update error: {e}")
+            time.sleep(0.2)
+    
+    def update_gui(self):
+    """Update GUI elements - ENHANCED with EPO status"""
+    # Connection status
+    if self.connected:
+        self.status_label.configure(text="CONNECTED", fg='green')
+    else:
+        self.status_label.configure(text="DISCONNECTED", fg='red')
+    
+    # System mode - Show EPO status in mode if active
+    mode_names = ["OFF", "HAND", "AUTO"]
+    mode_colors = ['red', 'orange', 'green']
+    
+    if self.main_epo or any(self.epo_alarms):
+        mode_text = "EPO ACTIVE"
+        mode_color = 'red'
+    elif self.emergency_stop:
+        mode_text = "E-STOP"
+        mode_color = 'red'
+    else:
+        mode_text = mode_names[self.system_mode] if self.system_mode < 3 else "UNKNOWN"
+        mode_color = mode_colors[self.system_mode] if self.system_mode < 3 else 'gray'
+    
+    self.mode_label.configure(text=mode_text, fg=mode_color)
+    
+    # Tank displays - ENHANCED with EPO status
+    for i, tank_widget in enumerate(self.tank_widgets):
+        level = self.tank_levels[i]
+        is_filling = self.valve_status[i]
+        has_hh_alarm = self.hh_alarms[i]
+        has_epo_alarm = self.epo_alarms[i]
+        has_alarm = has_hh_alarm or has_epo_alarm
+        
+        self.draw_tank(tank_widget['canvas'], level, is_filling, has_alarm)
+        tank_widget['level_label'].configure(text=f"{level:.1f}%")
+        
+        # Enhanced status display
+        if has_epo_alarm:
+            status = "EPO ACTIVE"
+            status_color = 'red'
+        elif has_hh_alarm:
+            status = "HH ALARM"
+            status_color = 'orange'
+        elif is_filling:
+            status = "FILLING"
+            status_color = 'green'
+        elif level >= 90:
+            status = "FULL"
+            status_color = 'blue'
+        else:
+            status = "IDLE"
+            status_color = 'gray'
+        
+        tank_widget['status_label'].configure(text=status, fg=status_color)
+    
+    # Pump status display
+    for i, pump_label in enumerate(self.pump_labels):
+        if self.pump_status[i]:
+            pump_label.configure(text="RUNNING", fg='green')
+        else:
+            pump_label.configure(text="STOPPED", fg='gray')
+    
+    # Flow rates
+    for i, flow_label in enumerate(self.flow_labels):
+        flow_label.configure(text=f"{self.flow_rates[i]:.1f} GPM")
+    
+    # Update valve buttons - Disabled if EPO active
+    for i, btn in enumerate(self.valve_buttons):
+        if self.valve_status[i]:
+            btn.configure(text=f"VALVE {i+1}\nOPEN", bg='green', fg='white')
+        else:
+            btn.configure(text=f"VALVE {i+1}\nCLOSED", bg='gray', fg='white')
+        
+        # Disable valve control if EPO is active
+        if self.epo_alarms[i] or self.main_epo:
+            btn.configure(state='disabled', bg='red')
+        elif self.system_mode == 1:
+            btn.configure(state='normal')
+        else:
+            btn.configure(state='disabled')
+    
+    # Update alarms
+    def update_alarms(self):
+    """ENHANCED alarm display with EPO status"""
+    self.alarm_listbox.delete(0, tk.END)
+    
+    alarm_count = 0
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    
+    # Connection status
+    if not self.connected:
+        self.alarm_listbox.insert(tk.END, f"{timestamp} - PLC COMMUNICATION LOST")
+        alarm_count += 1
+    
+    # CRITICAL: Main EPO status
+    if self.main_epo:
+        self.alarm_listbox.insert(tk.END, f"{timestamp} - 🚨 MAIN EPO ACTIVE 🚨")
+        alarm_count += 1
+    
+    # Emergency stop status  
+    if self.emergency_stop:
+        self.alarm_listbox.insert(tk.END, f"{timestamp} - 🚨 EMERGENCY STOP ACTIVE 🚨")
+        alarm_count += 1
+    
+    # Individual tank EPO alarms
+    for i in range(9):
+        if self.epo_alarms[i]:
+            self.alarm_listbox.insert(tk.END, f"{timestamp} - 🚨 TANK {i+1} EPO ACTIVE 🚨")
+            alarm_count += 1
+    
+    # HH alarms
+    for i in range(9):
+        if self.hh_alarms[i]:
+            self.alarm_listbox.insert(tk.END, f"{timestamp} - ⚠ TANK {i+1} HH ALARM")
+            alarm_count += 1
+    
+    if alarm_count == 0:
+        self.alarm_listbox.insert(tk.END, "No active alarms")
+        self.alarm_listbox.configure(fg='green')
+    else:
+        self.alarm_listbox.configure(fg='red')
+
+    
+    # Update statistics
+    self.update_statistics()
+    
+    def draw_tank(self, canvas, level, is_filling, has_alarm):
+        """Draw tank with level"""
+        canvas.delete("all")
+        
+        # Tank outline
+        x1, y1, x2, y2 = 20, 20, 100, 130
+        outline_color = '#ff0000' if has_alarm else '#666666'
+        canvas.create_rectangle(x1, y1, x2, y2, outline=outline_color, width=2, fill='#0a0a0a')
+        
+        # Liquid
+        if level > 0:
+            liquid_height = int((level / 100.0) * (y2 - y1 - 4))
+            liquid_y = y2 - liquid_height - 2
+            
+            if has_alarm:
+                color = '#ff6666'
+            elif is_filling:
+                color = '#66ff66' if int(time.time() * 2) % 2 else '#44dd44'
+            else:
+                color = '#4488ff'
+            
+            canvas.create_rectangle(x1 + 2, liquid_y, x2 - 2, y2 - 2, fill=color, outline='')
+        
+        # Level marks
+        for i in range(0, 101, 25):
+            y = y2 - int((i / 100.0) * (y2 - y1 - 4))
+            canvas.create_line(x2, y, x2 + 5, y, fill='white')
+            canvas.create_text(x2 + 10, y, text=f"{i}%", fill='white', font=('Arial', 7), anchor='w')
+    
+    def update_alarms(self):
+        """Update alarm display"""
+        self.alarm_listbox.delete(0, tk.END)
+        
+        alarm_count = 0
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        if not self.connected:
+            self.alarm_listbox.insert(tk.END, f"{timestamp} - PLC COMMUNICATION LOST")
+            alarm_count += 1
+        
+        if self.emergency_stop:
+            self.alarm_listbox.insert(tk.END, f"{timestamp} - EMERGENCY STOP ACTIVE")
+            alarm_count += 1
+        
+        for i in range(9):
+            if self.hh_alarms[i]:
+                self.alarm_listbox.insert(tk.END, f"{timestamp} - TANK {i+1} HH ALARM")
+                alarm_count += 1
+        
+        if alarm_count == 0:
+            self.alarm_listbox.insert(tk.END, "No active alarms")
+            self.alarm_listbox.configure(fg='green')
+        else:
+            self.alarm_listbox.configure(fg='red')
+    
+    def update_statistics(self):
+        """Update communication statistics"""
+        success_rate = 0
+        if self.read_count > 0:
+            success_rate = (self.success_count / self.read_count) * 100
+        
+        self.stats_labels["Total Reads:"].configure(text=str(self.read_count))
+        self.stats_labels["Successful:"].configure(text=str(self.success_count))
+        self.stats_labels["Success Rate:"].configure(text=f"{success_rate:.1f}%")
+        
+        error_text = self.modbus.last_error if self.modbus.last_error else "None"
+        if len(error_text) > 40:
+            error_text = error_text[:37] + "..."
+        self.stats_labels["Last Error:"].configure(text=error_text)
+    
+    def log_message(self, message):
+        """Add message to log"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+        self.log_text.insert(tk.END, log_entry)
+        self.log_text.see(tk.END)
+        
+        # Limit log size
+        lines = self.log_text.get(1.0, tk.END).split('\n')
+        if len(lines) > 100:
+            self.log_text.delete(1.0, tk.END)
+            self.log_text.insert(1.0, '\n'.join(lines[-100:]))
+    
+    def clear_log(self):
+        """Clear the log"""
+        self.log_text.delete(1.0, tk.END)
+        self.log_message("Log cleared")
+    
+    def update_ip(self):
+        """Update PLC IP address"""
+        new_ip = self.ip_entry.get().strip()
+        if new_ip != self.PLC_IP:
+            self.PLC_IP = new_ip
+            self.modbus = ArduinoModbusClient(self.PLC_IP, self.PLC_PORT)
+            self.log_message(f"IP updated to {self.PLC_IP}")
+    
+    def update_rate(self):
+        """Update communication rate"""
+        try:
+            new_rate = int(self.rate_var.get())
+            if 100 <= new_rate <= 5000:  # Reasonable limits
+                self.UPDATE_RATE = new_rate
+                self.log_message(f"Update rate changed to {new_rate}ms")
+            else:
+                messagebox.showerror("Invalid Rate", "Rate must be between 100-5000ms")
+        except ValueError:
+            messagebox.showerror("Invalid Rate", "Please enter a valid number")
+    
+    def test_connection(self):
+        """Test connection to PLC"""
+        self.log_message("Testing connection...")
+        result = self.modbus.read_holding_registers(0, 1)
+        if result:
+            self.log_message("✓ Connection test successful")
+            messagebox.showinfo("Connection Test", "Connection successful!")
+        else:
+            self.log_message(f"✗ Connection test failed: {self.modbus.last_error}")
+            messagebox.showerror("Connection Test", f"Connection failed:\n{self.modbus.last_error}")
+    
+    def test_system_status(self):
+        """Test reading system status including pump status"""
+        self.log_message("=== TESTING SYSTEM STATUS ===")
+        result = self.modbus.read_input_registers(0, 5)
+        if result and len(result) >= 5:
+            mode_names = ["OFF", "HAND", "AUTO"]
+            mode = mode_names[result[0]] if result[0] < 3 else f"UNKNOWN({result[0]})"
+            self.log_message(f"✓ System Mode: {mode}")
+            self.log_message(f"✓ Emergency Stop: {bool(result[1])}")
+            self.log_message(f"✓ Pump 1: {'RUNNING' if result[2] else 'STOPPED'}")
+            self.log_message(f"✓ Pump 2: {'RUNNING' if result[3] else 'STOPPED'}")
+            self.log_message(f"✓ System Enabled: {bool(result[4])}")
+        else:
+            self.log_message(f"✗ System status read failed: {self.modbus.last_error}")
+        self.log_message("==============================")
+
+def test_epo_status(self):
+    """Test reading EPO status specifically"""
+    self.log_message("=== TESTING EPO STATUS ===")
+    
+    # Test EPO status register
+    result = self.modbus.read_input_registers(8, 1)
+    if result and len(result) >= 1:
+        epo_status = result[0]
+        self.log_message(f"✓ EPO Status Register: {epo_status:016b} (binary)")
+        
+        # Decode individual EPO bits
+        for i in range(9):
+            tank_epo = bool(epo_status & (1 << i))
+            self.log_message(f"  Tank {i+1} EPO: {'ACTIVE' if tank_epo else 'OK'}")
+        
+        main_epo = bool(epo_status & (1 << 9))
+        self.log_message(f"  Main EPO: {'ACTIVE' if main_epo else 'OK'}")
+        
+    else:
+        self.log_message(f"✗ EPO status register read failed: {self.modbus.last_error}")
+        
+        # Try reading discrete inputs directly as fallback
+        self.log_message("Trying discrete input fallback...")
+        
+        # Test HH switches (discrete inputs 0-8)
+        hh_result = self.modbus.read_discrete_inputs(0, 9)
+        if hh_result:
+            active_hh = [i+1 for i, v in enumerate(hh_result[:9]) if v]
+            self.log_message(f"✓ HH Switches: {active_hh}")
+        
+        # Test EPO switches (discrete inputs 10-18)
+        try:
+            epo_result = self.modbus.read_discrete_inputs(10, 9)
+            if epo_result:
+                active_epo = [i+1 for i, v in enumerate(epo_result[:9]) if v]
+                self.log_message(f"✓ Tank EPOs: {active_epo}")
+        except Exception as e:
+            self.log_message(f"✗ Tank EPO read failed: {e}")
+        
+        # Test main EPO (discrete input 20)  
+        try:
+            main_result = self.modbus.read_discrete_inputs(20, 1)
+            if main_result:
+                self.log_message(f"✓ Main EPO: {'ACTIVE' if main_result[0] else 'OK'}")
+        except Exception as e:
+            self.log_message(f"✗ Main EPO read failed: {e}")
+    
+    self.log_message("==========================")
+
+def test_safety_systems(self):
+    """Test all safety systems"""
+    self.log_message("=== TESTING ALL SAFETY SYSTEMS ===")
+    
+    # Test system status
+    result = self.modbus.read_input_registers(0, 9)
+    if result and len(result) >= 9:
+        self.log_message("System Status:")
+        mode_names = ["OFF", "HAND", "AUTO"]
+        mode = mode_names[result[0]] if result[0] < 3 else f"UNKNOWN({result[0]})"
+        self.log_message(f"  Mode: {mode}")
+        self.log_message(f"  Emergency Stop: {'ACTIVE' if result[1] else 'OK'}")
+        self.log_message(f"  Pump 1: {'ON' if result[2] else 'OFF'}")
+        self.log_message(f"  Pump 2: {'ON' if result[3] else 'OFF'}")
+        self.log_message(f"  System Enable: {'YES' if result[4] else 'NO'}")
+        self.log_message(f"  Valves Filling: {result[5]}")
+        self.log_message(f"  HH Alarm Register: {result[6]:016b}")
+        self.log_message(f"  Sensor Faults: {result[7]:016b}")
+        if len(result) >= 9:
+            self.log_message(f"  EPO Status: {result[8]:016b}")
+    
+    # Test individual safety functions
+    self.test_epo_status()
+    
+    self.log_message("===================================")    
+    
+    def test_tank_batch(self):
+        """Test reading tank levels in batches"""
+        self.log_message("=== TESTING TANK BATCHES ===")
+        for batch in range(3):
+            start = batch * 3
+            count = min(3, 9 - start)
+            result = self.modbus.read_holding_registers(start, count)
+            if result:
+                levels = [result[i] / 100.0 for i in range(len(result))]
+                tank_names = [f"Tank{start+i+1}" for i in range(len(result))]
+                self.log_message(f"✓ Batch {batch + 1}: {dict(zip(tank_names, levels))}")
+            else:
+                self.log_message(f"✗ Batch {batch + 1} failed: {self.modbus.last_error}")
+            time.sleep(0.1)  # Small delay between batches
+        self.log_message("============================")
+    
+    def test_pump_status(self):
+        """Test reading pump status specifically"""
+        self.log_message("=== TESTING PUMP STATUS ===")
+        result = self.modbus.read_input_registers(2, 2)  # Read just pump status registers
+        if result and len(result) >= 2:
+            self.log_message(f"✓ Pump 1 Status Register: {result[0]} ({'RUNNING' if result[0] else 'STOPPED'})")
+            self.log_message(f"✓ Pump 2 Status Register: {result[1]} ({'RUNNING' if result[1] else 'STOPPED'})")
+        else:
+            self.log_message(f"✗ Pump status read failed: {self.modbus.last_error}")
+        self.log_message("===========================")
+    
+    def test_valves(self):
+        """Test reading valve status"""
+        self.log_message("=== TESTING VALVE STATUS ===")
+        result = self.modbus.read_coils(0, 9)
+        if result:
+            open_valves = [i+1 for i, v in enumerate(result[:9]) if v]
+            self.log_message(f"✓ Open valves: {open_valves}")
+            for i in range(9):
+                status = "OPEN" if result[i] else "CLOSED"
+                self.log_message(f"  Valve {i+1}: {status}")
+        else:
+            self.log_message(f"✗ Valve read failed: {self.modbus.last_error}")
+        self.log_message("============================")
+    
+    def toggle_valve(self, valve_index):
+        """Toggle valve state"""
+        if self.system_mode != 1:
+            messagebox.showwarning("Invalid Operation", "Valve control only available in HAND mode")
+            return
+        
+        new_state = not self.valve_status[valve_index]
+        if self.modbus.write_coil(valve_index, new_state):
+            action = "OPENED" if new_state else "CLOSED"
+            self.log_message(f"Valve {valve_index + 1} {action}")
+        else:
+            messagebox.showerror("Control Error", f"Failed to control valve {valve_index + 1}")
+    
+    def emergency_stop_command(self):
+        """Emergency stop command"""
+        result = messagebox.askyesno("Emergency Stop", 
+                                   "Are you sure you want to activate EMERGENCY STOP?")
+        if result:
+            if self.modbus.write_coil(42, True):
+                self.log_message("EMERGENCY STOP ACTIVATED")
+                messagebox.showinfo("Emergency Stop", "Emergency stop activated")
+            else:
+                messagebox.showerror("Control Error", "Failed to activate emergency stop")
+    
+    def on_closing(self):
+        """Handle application closing"""
+        self.running = False
+        self.root.destroy()
+    
+    def run(self):
+        """Run the application"""
+        self.root.mainloop()
+
+def main():
+    print("=" * 60)
+    print("Tank Control HMI v5.1 - Bug Fixes")
+    print("=" * 60)
+    print("✓ Pump status reading FIXED")
+    print("✓ Timeout handling improved")
+    print("✓ More efficient data reading")
+    print("✓ Better error handling")
+    print("=" * 60)
+    
+    try:
+        hmi = TankControlHMI()
+        hmi.run()
+    except KeyboardInterrupt:
+        print("\nApplication terminated by user")
+    except Exception as e:
+        print(f"\nApplication error: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
