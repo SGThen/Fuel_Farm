@@ -10,6 +10,9 @@ There are:
   1 4-20mA level sensor each
   1 red light each
 
+  Red light is run off the NC contact of the Relay for the lights. the open coil is green light
 
-First step is to get the pumps to run in a lead lag not based on time but running instanses. 
-then it is on to running a fail safe for if a pump does not start. 
+  HH swtich is to be wired to the motorized ball valve. so that, the HH switch opens and the ball valve is set to NC from factory. 
+
+Updated with new sketch and HMI GUI. #sisterhen 12AUG2025
+Working on getting the EPO functions and the HH functions to work in the sketch and the HMI #Sisterhen 12AUG2025
